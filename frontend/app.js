@@ -202,17 +202,26 @@ function newLocalConversationId() {
 
 function loadLocalConversations() {
   try {
-    const list = JSON.parse(sessionStorage.getItem(LOCAL_CONV_KEY) || '[]');
+    const list = JSON.parse(localStorage.getItem(LOCAL_CONV_KEY) || '[]');
     return Array.isArray(list) ? list : [];
   } catch {
     return [];
   }
 }
 
+// Persist guest conversations in localStorage (not sessionStorage) so history
+// survives tab closes and browser restarts. Cap the list: each entry carries a
+// full payload snapshot and localStorage quota is ~5MB.
+const LOCAL_CONV_MAX = 20;
 function saveLocalConversations(list) {
-  try {
-    sessionStorage.setItem(LOCAL_CONV_KEY, JSON.stringify(list));
-  } catch { /* ignore */ }
+  const trimmed = [...list]
+    .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
+  for (const cap of [LOCAL_CONV_MAX, 10, 3]) {
+    try {
+      localStorage.setItem(LOCAL_CONV_KEY, JSON.stringify(trimmed.slice(0, cap)));
+      return;
+    } catch { /* quota exceeded — retry with fewer entries */ }
+  }
 }
 
 function newNodeId() {
@@ -1086,6 +1095,7 @@ function renderChat() {
   bindCitations();
   bindFigures();
   bindTables();
+  bindMolecularCards();
   updateShareChatBtn();
   if (state.evidenceMsgId) {
     const stillThere = findMessageByEvidenceId(state.evidenceMsgId);
@@ -1275,8 +1285,90 @@ function renderAnswerBody(payload, fallbackText) {
   if (unanchored.length) {
     html += `<div class="answer-block"><h3>相关流程图</h3>${unanchored.map((f, i) => renderFigureCard(f, `u-${i}`)).join('')}</div>`;
   }
+  const molCard = renderMolecularCard(payload);
+  if (molCard) html += molCard;
+  const molHint = renderMolecularHint(payload);
+  if (molHint) html += molHint;
   html += `<p class="ai-disclaimer">本回答由 AI 生成，内容仅供参考，请仔细甄别</p>`;
   return html;
+}
+
+function renderMolecularHint(payload) {
+  const hint = payload && payload.molecular_hint;
+  if (!hint || payload.molecular_evidence) return '';
+  const variantsText = hint.variants_text || (hint.genes || []).join(' ');
+  const href = molecularEvidenceHrefWith(variantsText, 'DLBCL');
+  return `
+    <div class="mol-hint">
+      <span>${escapeHtml(hint.message || '')}</span>
+      <button type="button" class="btn ghost" data-mol-open="${escapeHtml(href)}">打开分子证据页</button>
+    </div>`;
+}
+
+function molecularEvidenceHrefWith(variantsText, disease) {
+  const dir = molecularEvidenceHref().replace(/molecular-evidence\.html$/, '');
+  const params = new URLSearchParams();
+  if (variantsText) params.set('variants', variantsText);
+  if (disease) params.set('disease', disease || 'DLBCL');
+  params.set('autorun', '1');
+  return `${dir}molecular-evidence.html?${params.toString()}`;
+}
+
+function renderMolecularCard(payload) {
+  const mol = payload && payload.molecular_evidence;
+  if (!mol) return '';
+  const variants = Array.isArray(mol.variants) ? mol.variants : [];
+  const evidence = Array.isArray(mol.evidence) ? mol.evidence : [];
+  if (!variants.length && !evidence.length) return '';
+  const isMock = mol.provider_mode && mol.provider_mode !== 'live';
+  const variantRows = variants.map((v) => {
+    const hgvs = v.protein_hgvs || v.cdna_hgvs || v.genomic_hgvs || v.unresolved_position || '未明确位点';
+    return `
+      <tr>
+        <td class="mol-gene">${escapeHtml(v.gene || '—')}</td>
+        <td>${escapeHtml(String(hgvs))}</td>
+        <td class="mol-mapping">${escapeHtml(v.mapping_status || '')}</td>
+        <td>${escapeHtml((v.disease_match || v.disease || '') + '')}</td>
+      </tr>`;
+  }).join('');
+  const evidenceRows = evidence.map((e, i) => {
+    const title = e.source_title || e.title || e.provider || '证据卡';
+    const meta = [e.evidence_level, e.disease].filter(Boolean).join(' · ');
+    const claim = e.claim || e.summary || '';
+    return `
+      <li class="mol-evidence-item" data-mol-index="${i}">
+        <span class="mol-cite">M${variants.length + i + 1}</span>
+        <div>
+          <div class="mol-evidence-title">${escapeHtml(String(title))}</div>
+          ${meta ? `<div class="mol-evidence-meta">${escapeHtml(meta)}</div>` : ''}
+          ${claim ? `<div class="mol-evidence-claim">${escapeHtml(String(claim))}</div>` : ''}
+        </div>
+      </li>`;
+  }).join('');
+  const warnings = Array.isArray(mol.global_warnings) ? mol.global_warnings.filter(Boolean) : [];
+  const variantsText = (mol.query && mol.query.variants_text) || variants
+    .map((v) => `${v.gene || ''} ${v.protein_hgvs || v.cdna_hgvs || ''}`.trim())
+    .filter(Boolean)
+    .join(', ');
+  const href = molecularEvidenceHrefWith(variantsText, (mol.query && mol.query.disease) || 'DLBCL');
+  return `
+    <div class="mol-card" id="mol-card-${escapeHtml(String((payload.run_id || 'x')))}">
+      <div class="mol-head">
+        <span class="mol-title">分子证据 · CIViC / ClinVar / gnomAD / MyVariant / VEP</span>
+        ${isMock ? '<span class="mol-badge mock">演示数据 · 非实时</span>' : '<span class="mol-badge live">实时检索</span>'}
+      </div>
+      ${variantRows ? `
+      <table class="mol-variants">
+        <thead><tr><th>基因</th><th>HGVS</th><th>映射</th><th>疾病</th></tr></thead>
+        <tbody>${variantRows}</tbody>
+      </table>` : ''}
+      ${evidenceRows ? `<ul class="mol-evidence">${evidenceRows}</ul>` : ''}
+      ${warnings.length ? `<div class="mol-warn">${escapeHtml(warnings.join('；'))}</div>` : ''}
+      <div class="mol-foot">
+        <button type="button" class="btn ghost" data-mol-open="${escapeHtml(href)}">在分子证据页查看完整报告</button>
+        <span class="mol-note">分子证据仅作补充线索，不替代指南推荐</span>
+      </div>
+    </div>`;
 }
 
 function renderTableCard(s, key) {
@@ -1333,6 +1425,20 @@ function decorateCitations(html, payload) {
     return `<button class="cite" data-cite="${type}"${indexAttr}${refAttr} aria-label="${tip}">${n}</button>`;
   };
   return html
+    .replace(/\[M(\d+)\]/gi, (_, n) => {
+      const mol = payload.molecular_evidence || {};
+      const variants = Array.isArray(mol.variants) ? mol.variants : [];
+      const evidence = Array.isArray(mol.evidence) ? mol.evidence : [];
+      const idx = Number(n) - 1;
+      const hit = idx < variants.length
+        ? variants[idx]
+        : evidence[idx - variants.length] || {};
+      const tip = escapeHtml(
+        (hit.gene ? `${hit.gene} ${hit.protein_hgvs || hit.cdna_hgvs || ''}` : '')
+        || hit.source_title || hit.title || `分子证据${n}`
+      );
+      return citeBtn('M', idx, null, tip, n);
+    })
     .replace(/\[S(\d+)\]/gi, (_, n) => {
       const idx = Number(n) - 1;
       const s = sources[idx] || {};
@@ -1563,6 +1669,16 @@ function bindFigures() {
     el.addEventListener('click', (e) => {
       e.preventDefault();
       openLightbox(el.getAttribute('data-fig-open'), el.getAttribute('data-fig-label') || '');
+    });
+  });
+}
+
+function bindMolecularCards() {
+  els.chatLog.querySelectorAll('[data-mol-open]').forEach((el) => {
+    el.addEventListener('click', (e) => {
+      e.preventDefault();
+      const href = el.getAttribute('data-mol-open');
+      if (href) window.open(href, '_blank', 'noopener');
     });
   });
 }
@@ -2079,6 +2195,12 @@ function bindCitations() {
     let key = '';
     if (type === 'S' || type === 'G' || type === 'L') key = `${type}-${btn.dataset.index}`;
     else if (type === 'R') key = `R-${btn.dataset.ref}`;
+    if (type === 'M') {
+      hidePopover();
+      const card = row?.querySelector?.('.mol-card');
+      if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
     openEvidence(msgId, key);
   };
 
@@ -2122,6 +2244,27 @@ function bindCitations() {
         <div class="muted small" style="margin-top:8px;max-width:320px;white-space:pre-wrap">${escapeHtml((g.evidence_text || '').slice(0, 220))}</div>
         <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
           <button class="btn primary" data-open-neo4j>查看图谱</button>
+        </div>`;
+    } else if (type === 'M') {
+      const mol = payload.molecular_evidence || {};
+      const variants = Array.isArray(mol.variants) ? mol.variants : [];
+      const evidence = Array.isArray(mol.evidence) ? mol.evidence : [];
+      const idx = Number(btn.dataset.index);
+      const hit = idx < variants.length ? variants[idx] : evidence[idx - variants.length] || {};
+      const isVariant = idx < variants.length;
+      const title = isVariant
+        ? `${hit.gene || '—'} ${hit.protein_hgvs || hit.cdna_hgvs || hit.genomic_hgvs || ''}`
+        : (hit.source_title || hit.title || hit.provider || '证据卡');
+      const meta = isVariant
+        ? (hit.mapping_status || '')
+        : [hit.evidence_level, hit.disease].filter(Boolean).join(' · ');
+      html = `
+        <div class="ref-head"><span class="k">Molecular</span><span class="badge mol">${escapeHtml(mol.provider_mode || '')}</span></div>
+        <div class="ref-title">${escapeHtml(String(title).trim() || '分子证据')}</div>
+        ${meta ? `<div class="ref-meta"><span>${escapeHtml(meta)}</span><span class="badge">${escapeHtml(hit.provider || (isVariant ? '变异' : '数据库'))}</span></div>` : ''}
+        ${hit.claim || hit.summary ? `<div class="muted small" style="margin-top:8px;max-width:320px;white-space:pre-wrap">${escapeHtml(String(hit.claim || hit.summary).slice(0, 220))}</div>` : ''}
+        <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn primary" data-see-all>查看证据卡</button>
         </div>`;
     } else {
       const r = (payload.attached_references || []).find((x) => String(x.ref_number) === String(btn.dataset.ref)) || {};
@@ -3753,3 +3896,14 @@ mobileMQ.addEventListener('change', (e) => {
 resizeComposer();
 renderChat();
 refreshMe();
+
+// Deep link from the molecular evidence page: ?q=... prefills the composer
+// (never auto-sends — the doctor reviews the question first).
+(function applyQuestionDeepLink() {
+  const params = new URLSearchParams(location.search || '');
+  const q = (params.get('q') || '').trim();
+  if (!q || !els.followUpInput) return;
+  els.followUpInput.value = q;
+  resizeComposer();
+  els.followUpInput.focus();
+})();

@@ -585,6 +585,7 @@ class EvidenceBundle:
     graph_triples: List[GraphTriple] = field(default_factory=list)
     graph_context: List[str] = field(default_factory=list)
     literature: List[LiteratureHit] = field(default_factory=list)
+    molecular_evidence: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -602,6 +603,8 @@ class QAResult:
     graph_triples: List[GraphTriple] = field(default_factory=list)
     graph_seed_candidates: List[str] = field(default_factory=list)
     literature: List[LiteratureHit] = field(default_factory=list)
+    molecular_evidence: Optional[Dict[str, Any]] = None
+    molecular_hint: Optional[Dict[str, Any]] = None
     generation_mode: str = "text"          # "text" (Qwen) | "multimodal" (VLM)
     answer_kind: str = "guideline"         # guideline | general_medical | chitchat
     standalone_question: Optional[str] = None
@@ -646,6 +649,8 @@ class QAResult:
             "sources": [enrich_source_dict(doc) for doc in self.sources],
             "attached_references": [enrich_reference_dict(ref) for ref in self.attached_references],
             "literature": [enrich_literature_dict(hit) for hit in self.literature],
+            "molecular_evidence": self.molecular_evidence,
+            "molecular_hint": self.molecular_hint,
             "graph_triples": [triple.to_dict() for triple in self.graph_triples],
             "graph_seed_candidates": self.graph_seed_candidates,
             "reference_links": self.reference_links,

@@ -59,9 +59,9 @@ def test_molecular_evidence_query_smoke(client: TestClient):
     assert len(body["variants"]) == 2
     assert [v["mapping_status"] for v in body["variants"]] == ["unique", "unique"]
     assert all(v["genomic_hgvs"] and v["genome_build"] == "GRCh38" for v in body["variants"])
-    assert len(body["evidence"]) == 5
+    assert len(body["evidence"]) == 9
     providers = {card["provider"] for card in body["evidence"]}
-    assert {"ClinVar", "CIViC", "MyVariant"} <= providers
+    assert {"ClinVar", "CIViC", "MyVariant", "gnomAD", "EnsemblVEP"} <= providers
     disease_matches = [card["disease_match"] for card in body["evidence"]]
     assert disease_matches.count("DLBCL直接证据") >= 2
     assert any(match != "DLBCL直接证据" for match in disease_matches)
@@ -76,11 +76,11 @@ def test_molecular_evidence_query_smoke(client: TestClient):
     assert isinstance(body["missing"]["blocking"], list)
     assert isinstance(body["missing"]["advisory"], list)
     assert body["meta"]["provider_mode"] == "mock"
-    assert body["meta"]["required_providers"] == ["ClinVar", "CIViC"]
-    assert body["meta"]["extended_providers"] == ["MyVariant"]
+    assert body["meta"]["required_providers"] == ["ClinVar", "CIViC", "MyVariant", "gnomAD", "EnsemblVEP"]
+    assert body["meta"]["extended_providers"] == []
     assert body["audit"]["provider_status"]["ClinVar"]["queried"] is True
     assert body["audit"]["provider_status"]["CIViC"]["queried"] is True
-    assert body["audit"]["provider_status"]["MyVariant"]["required"] is False
+    assert body["audit"]["provider_status"]["MyVariant"]["required"] is True
     assert body["audit"]["resolver_status"]["resolved_count"] == 2
     assert any(step["step"] == "resolve_variant" and step["status"] == "resolved" for step in body["audit"]["agent_trace"])
     assert any(step["step"] == "complete" for step in body["audit"]["agent_trace"])
@@ -128,7 +128,7 @@ def test_molecular_evidence_query_smoke(client: TestClient):
     assert body2["meta"]["cache_hit"] is True
     assert body2["meta"]["query_log_id"]
     assert body2["meta"]["cache_entry_id"]
-    assert len(body2["evidence"]) == 5
+    assert len(body2["evidence"]) == 9
     assert len(body2["safety"]["variant_gates"]) == 2
 
 
@@ -225,14 +225,16 @@ def test_molecular_evidence_agent_queries_all_providers_per_variant(client: Test
     assert resp.status_code == 200
     body = resp.json()
     query_steps = [step for step in body["audit"]["agent_trace"] if step["step"] == "query_provider"]
-    assert len(query_steps) == 6
-    assert {step["provider"] for step in query_steps} == {"ClinVar", "CIViC", "MyVariant"}
+    assert len(query_steps) == 10
+    assert {step["provider"] for step in query_steps} == {"ClinVar", "CIViC", "MyVariant", "gnomAD", "EnsemblVEP"}
     assert all(step["queried"] is True for step in query_steps)
 
 
 def test_molecular_agent_marks_provider_exception_as_degraded():
     from backend.app.services.molecular_evidence import (
         MockEvidenceProvider,
+        MockGnomADProvider,
+        MockVEPProvider,
         MolecularEvidenceAgent,
         MolecularInputParser,
         _ProviderView,
@@ -250,7 +252,7 @@ def test_molecular_agent_marks_provider_exception_as_degraded():
     mock = MockEvidenceProvider()
     agent = MolecularEvidenceAgent(
         provider_mode="live",
-        providers=[FailingClinVar(), _ProviderView(mock, "CIViC")],
+        providers=[FailingClinVar(), _ProviderView(mock, "CIViC"), _ProviderView(mock, "MyVariant"), MockGnomADProvider(), MockVEPProvider()],
     )
 
     records, trace, status, resolver_status = agent.run([variant])
@@ -266,6 +268,8 @@ def test_molecular_agent_marks_provider_exception_as_degraded():
 def test_molecular_agent_deduplicates_provider_records():
     from backend.app.services.molecular_evidence import (
         MockEvidenceProvider,
+        MockGnomADProvider,
+        MockVEPProvider,
         MolecularEvidenceAgent,
         MolecularInputParser,
         _ProviderView,
@@ -286,7 +290,7 @@ def test_molecular_agent_deduplicates_provider_records():
     )[0]
     agent = MolecularEvidenceAgent(
         provider_mode="mock",
-        providers=[_ProviderView(MockEvidenceProvider(), "ClinVar"), DuplicateCivic()],
+        providers=[_ProviderView(MockEvidenceProvider(), "ClinVar"), DuplicateCivic(), _ProviderView(MockEvidenceProvider(), "MyVariant"), MockGnomADProvider(), MockVEPProvider()],
     )
 
     records, trace, status, resolver_status = agent.run([variant])
@@ -398,9 +402,13 @@ def test_parser_keeps_distinct_protein_changes_and_different_transcripts():
 
 def test_molecular_agent_deduplicates_same_record_from_different_variants():
     from backend.app.services.molecular_evidence import (
+        MockEvidenceProvider,
+        MockGnomADProvider,
+        MockVEPProvider,
         MolecularEvidenceAgent,
         MolecularInputParser,
         RawEvidenceRecord,
+        _ProviderView,
         utc_now_iso,
     )
 
@@ -443,7 +451,7 @@ def test_molecular_agent_deduplicates_same_record_from_different_variants():
 
     agent = MolecularEvidenceAgent(
         provider_mode="live",
-        providers=[SameRecordClinVar(), NoOpCivic()],
+        providers=[SameRecordClinVar(), NoOpCivic(), _ProviderView(MockEvidenceProvider(), "MyVariant"), MockGnomADProvider(), MockVEPProvider()],
     )
     records, trace, status, resolver_status = agent.run(variants)
 

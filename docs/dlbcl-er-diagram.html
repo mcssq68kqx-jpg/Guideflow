@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DLBCL 智能问答与数据管理系统 · 数据库 E-R 图</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: #fff; }
+    svg { display: block; width: 100%; height: auto; background: #fff; }
+    text { font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif; }
+  </style>
+</head>
+<body>
+<svg viewBox="0 0 1280 905" xmlns="http://www.w3.org/2000/svg" aria-label="DLBCL智能问答与数据管理系统数据库E-R图">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#000"/>
+    </marker>
+  </defs>
+  <rect width="1280" height="905" fill="#fff"/>
+  <text x="640" y="23" text-anchor="middle" font-size="17" font-weight="700" fill="#000">DLBCL 智能问答与数据管理系统 · 数据库 E-R 图</text>
+
+  <g fill="none" stroke="#000" stroke-width="1.2" stroke-dasharray="5 4">
+    <rect x="16" y="34" width="1248" height="92" rx="8"/><rect x="16" y="140" width="1248" height="84" rx="8"/>
+    <rect x="16" y="238" width="1248" height="104" rx="8"/><rect x="16" y="356" width="1248" height="94" rx="8"/>
+    <rect x="16" y="464" width="1248" height="104" rx="8"/><rect x="16" y="582" width="1248" height="84" rx="8"/>
+    <rect x="16" y="680" width="1248" height="94" rx="8"/>
+  </g>
+  <g font-size="13" font-weight="700" fill="#000">
+    <text x="30" y="56">① 用户与权限</text><text x="30" y="162">② 隐私与审计</text><text x="30" y="260">③ 数据管理</text>
+    <text x="30" y="378">④ 知识图谱</text><text x="30" y="486">⑤ 智能问答</text><text x="30" y="604">⑥ 混合 RAG</text><text x="30" y="702">⑦ 临床辅助输出</text>
+  </g>
+
+  <g fill="none" stroke="#000" stroke-width="1.4" marker-end="url(#arrow)">
+    <path d="M599 80 H319"/><path d="M599 80 H879"/><path d="M599 80 H1159"/><path d="M599 80 V182 H539"/><path d="M599 80 V182 H899"/>
+    <path d="M599 80 V290 H249"/><path d="M599 80 V290 H529"/><path d="M599 80 V290 H809"/><path d="M599 80 V290 H1089"/>
+    <path d="M599 80 V403 H419"/><path d="M599 80 V403 H689"/><path d="M599 80 V403 H959"/>
+    <path d="M599 80 V516 H249"/><path d="M599 80 V516 H529"/><path d="M599 80 V516 H809"/><path d="M599 80 V516 H1089"/>
+    <path d="M599 80 V624 H539"/><path d="M599 80 V624 H899"/><path d="M599 80 V727 H419"/><path d="M599 80 V727 H689"/><path d="M599 80 V727 H959"/>
+  </g>
+  <g font-size="10" font-weight="700" fill="#000" text-anchor="middle">
+    <text x="458" y="74">1:1</text><text x="739" y="74">1:N</text><text x="879" y="74">M:N</text><text x="570" y="174">1:N</text><text x="630" y="174">1:N</text>
+  </g>
+
+  <g fill="#fff" stroke="#000" stroke-width="1.7">
+    <rect x="461" y="61" width="138" height="38" rx="6"/><rect x="181" y="61" width="138" height="38" rx="6"/><rect x="741" y="61" width="138" height="38" rx="6"/><rect x="1021" y="61" width="138" height="38" rx="6"/>
+    <rect x="401" y="163" width="138" height="38" rx="6"/><rect x="761" y="163" width="138" height="38" rx="6"/>
+    <rect x="111" y="271" width="138" height="38" rx="6"/><rect x="391" y="271" width="138" height="38" rx="6"/><rect x="671" y="271" width="138" height="38" rx="6"/><rect x="951" y="271" width="138" height="38" rx="6"/>
+    <rect x="281" y="384" width="138" height="38" rx="6"/><rect x="551" y="384" width="138" height="38" rx="6"/><rect x="821" y="384" width="138" height="38" rx="6"/>
+    <rect x="111" y="497" width="138" height="38" rx="6"/><rect x="391" y="497" width="138" height="38" rx="6"/><rect x="671" y="497" width="138" height="38" rx="6"/><rect x="951" y="497" width="138" height="38" rx="6"/>
+    <rect x="401" y="605" width="138" height="38" rx="6"/><rect x="761" y="605" width="138" height="38" rx="6"/>
+    <rect x="281" y="708" width="138" height="38" rx="6"/><rect x="551" y="708" width="138" height="38" rx="6"/><rect x="821" y="708" width="138" height="38" rx="6"/>
+  </g>
+  <g fill="#000" font-size="12" text-anchor="middle">
+    <text x="530" y="85">用户</text><text x="250" y="85">用户资料</text><text x="810" y="85">登录日志</text><text x="1090" y="85">角色权限</text>
+    <text x="470" y="187">数据访问授权</text><text x="830" y="187">审计日志</text>
+    <text x="180" y="295">数据源</text><text x="460" y="295">采集任务</text><text x="740" y="295">医学文档</text><text x="1020" y="295">数据标注</text>
+    <text x="350" y="408">图谱版本</text><text x="620" y="408">图谱实体</text><text x="890" y="408">实体关系</text>
+    <text x="180" y="521">模型配置</text><text x="460" y="521">会话</text><text x="740" y="521">消息</text><text x="1020" y="521">Agent任务</text>
+    <text x="470" y="629">检索证据</text><text x="830" y="629">重排记录</text>
+    <text x="350" y="732">患者信息</text><text x="620" y="732">临床报告</text><text x="890" y="732">就诊准备建议</text>
+  </g>
+  <g fill="#000" font-size="11">
+    <rect x="960" y="800" width="300" height="48" rx="7" fill="#fff" stroke="#000"/>
+    <text x="976" y="819">矩形 = 实体（属性见信息表）</text><text x="976" y="838">箭头线 = 关联，标注 = 基数</text>
+  </g>
+</svg>
+</body>
+</html>

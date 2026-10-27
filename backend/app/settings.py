@@ -77,6 +77,12 @@ class Settings:
     enable_vlm: bool = True
     enable_flowchart: bool = True
     enable_kg: bool = True
+    enable_molecular_evidence: bool = True
+    # Default data-source mode for molecular evidence triggered from the main QA
+    # pipeline: mock (no network) | live (real ClinVar/CIViC/...) | hybrid.
+    molecular_provider_mode_default: str = "mock"
+    # Max seconds the main answer waits for the concurrent molecular sub-agent.
+    molecular_wait_timeout_s: float = 25.0
     source_label: str = "NCCN B 细胞淋巴瘤指南"
     # ── PubMed secondary literature (abstract-only) ──────────────────────
     literature_enabled_default: bool = False
@@ -334,6 +340,21 @@ def load_settings() -> Settings:
             _cfg_or_env(cfg, "ENABLE_EVIDENCE_GATING", "true", "enable_evidence_gating"),
             default=True,
         ),
+        enable_molecular_evidence=_as_bool(
+            _cfg_or_env(cfg, "ENABLE_MOLECULAR_EVIDENCE", "true", "enable_molecular_evidence"),
+            default=True,
+        ),
+        molecular_provider_mode_default=str(
+            _cfg_or_env(
+                cfg,
+                "MOLECULAR_PROVIDER_MODE_DEFAULT",
+                "mock",
+                "molecular_provider_mode_default",
+            )
+        ).strip().lower(),
+        molecular_wait_timeout_s=float(
+            _cfg_or_env(cfg, "MOLECULAR_WAIT_TIMEOUT_S", "25", "molecular_wait_timeout_s")
+        ),
         crop_enabled=_as_bool(_cfg_or_env(cfg, "CROP_ENABLED", "true", "crop", "enabled"), default=True),
         crop_dpi=crop_dpi,
         crop_padding=float(_cfg_or_env(cfg, "CROP_PADDING", "0.02", "crop", "padding")),
@@ -446,6 +467,7 @@ _SOURCE_DEFAULTS: dict[str, dict[str, Any]] = {
         "enable_vlm": True,
         "enable_flowchart": True,
         "enable_kg": True,
+        "enable_molecular_evidence": True,
     },
     "csco": {
         "label": "CSCO 淋巴瘤诊疗指南 2025",
@@ -458,6 +480,7 @@ _SOURCE_DEFAULTS: dict[str, dict[str, Any]] = {
         "enable_vlm": False,
         "enable_flowchart": False,
         "enable_kg": False,
+        "enable_molecular_evidence": True,
     },
     "eha": {
         "label": "EHA 大B细胞淋巴瘤临床实践指南 2025",
@@ -470,6 +493,7 @@ _SOURCE_DEFAULTS: dict[str, dict[str, Any]] = {
         "enable_vlm": False,
         "enable_flowchart": False,
         "enable_kg": False,
+        "enable_molecular_evidence": True,
     },
 }
 
@@ -557,5 +581,6 @@ def settings_for_source(source_key: str, base: Optional[Settings] = None) -> Set
         enable_vlm=_cap("enable_vlm"),
         enable_flowchart=_cap("enable_flowchart"),
         enable_kg=_cap("enable_kg"),
+        enable_molecular_evidence=_cap("enable_molecular_evidence"),
         source_label=label,
     )

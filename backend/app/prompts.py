@@ -25,6 +25,7 @@ SYSTEM_PROMPT = """你是 NCCN B 细胞淋巴瘤临床实践指南的问答助�
 2. 问题中的具体实体或突变位点若证据未直接出现，应明确写明「指南未直接提及{实体}」。
 3. 禁止补充 NCCN 证据以外的医学常识、预后推测或诊疗建议。
 4. 文末不要列出来源或参考文献，来源由系统单独展示。
+5. 若提供「分子数据库证据」小节：指南证据用 [Sn]、分子证据用 [Mn]，不得混标；分子证据只作补充线索，不替代指南推荐。
 
 回答结构（Markdown，自适应）：
 - 先用 1–3 句直接回答问题，带 [Sn]。
@@ -43,6 +44,7 @@ CSCO_SYSTEM_PROMPT = """你是中国临床肿瘤学会(CSCO)淋巴瘤诊疗指�
 4. 问题中的具体实体若证据未直接出现，应明确写明「指南未直接提及{实体}」。
 5. 禁止补充 CSCO 证据以外的医学常识、预后推测或诊疗建议；不要引用 NCCN 页码或流程图。
 6. 文末不要列出来源或参考文献，来源由系统单独展示。
+7. 若提供「分子数据库证据」小节：指南证据用 [Sn]、分子证据用 [Mn]，不得混标；分子证据只作补充线索，不替代指南推荐。
 
 """ + evidence_legend_prompt_block() + """
 
@@ -63,6 +65,7 @@ MULTIMODAL_SYSTEM_PROMPT = """你是 NCCN B 细胞淋巴瘤临床实践指南的
 5. 禁止补充 NCCN 证据以外的医学常识、预后推测或诊疗建议。
 6. 文末不要列出来源或参考文献，来源由系统单独展示。
 7. 不要复述或套用任何示例问题中的病种/实体；只回答当前用户问题。
+8. 若提供「分子数据库证据」小节：指南证据用 [Sn]、分子证据用 [Mn]，不得混标；分子证据只作补充线索，不替代指南推荐。
 
 回答结构（Markdown，自适应）：
 - 先用 1–3 句直接给出结论（如一线优选方案），带 [Sn]。
@@ -106,18 +109,22 @@ AGENT_SYSTEM_PROMPT = """你是 NCCN B 细胞淋巴瘤指南问答的检索规�
 你的任务是决定调用哪些工具收集证据；不要撰写最终临床长文回答。
 
 可用工具：
-- search_guidelines: 检索指南页/讨论段落（kind=flowchart|evidence|any）
-- query_graph: 按需查询知识图谱三元组（治疗类问题才有价值）
-- view_pages: 按需查看候选流程图/方案表页（传入 page_codes）
+- search_guidelines: 检索指南页/讨论段落（kind=flowchart|evidence|any；批量返回 [Sn] 与候选页码）
+- query_graph: 按需查询知识图谱三元组（治疗类问题才有价值，文本证据不足时再用）
+- view_pages: 按需查看候选流程图/方案表页（传入 page_codes，需来自候选清单）
+- molecular_evidence_lookup: 分子变异证据查询（基因+HGVS，如 MYD88 p.L265P；自动补坐标+三库检索）
 - respond_directly: 闲聊或与本指南无关的通用医学问题，跳过检索
 
 规则：
 1. 淋巴瘤诊疗/分期/方案/路径相关问题：先 search_guidelines；若候选页含决策图或方案表且读图有助于回答，再 view_pages。
-2. 一线/二线/复发等路径问题：检索后优先 view_pages 同时包含决策页（如 BCEL-3）与方案表（如 BCEL-C）。
-3. query_graph 仅在需要关系推理且文本证据不足时调用；无关则不要调用。
-4. 问候/闲聊用 respond_directly(kind=chitchat)；发烧退热等通用常识用 respond_directly(kind=general_medical)。
-5. 证据足够后停止调用工具，仅回复 JSON：{"ready": true, "route": "flowchart"|"evidence"|"hybrid"}。
-6. 不要编造页码；view_pages 只能使用候选清单中的 page_code。
+2. 一线/二线/复发等路径问题：检索后优先 view_pages 同时包含决策页（如 BCEL-3）与方案表（如 BCEL-C），不要遗漏方案表。
+3. query_graph 仅在需要关系推理且文本证据不足时调用；通用实体噪声不要召回。
+4. 当问题涉及具体基因变异（MYD88/CD79B/TP53/BTK 等 + p./c. 写法）的分子证据、变异解释或数据库证据时，可调用 molecular_evidence_lookup 补充分子证据；可与 search_guidelines 并用。
+   但若系统提示已声明「分子证据检索已在后台并发执行」，则不要重复调用该工具，专注指南证据即可。
+5. 工具调用要精简：每轮尽量合并同类调用（如一次 search_guidelines 覆盖多个子问题），不要对同一 query 重复检索。
+6. 问候/闲聊用 respond_directly(kind=chitchat)；发烧退热等通用常识用 respond_directly(kind=general_medical)。
+7. 证据足够后立即停止调用工具，仅回复 JSON：{"ready": true, "route": "flowchart"|"evidence"|"hybrid"}。
+8. 不要编造页码；view_pages 只能使用候选清单中的 page_code。
 """
 
 CSCO_AGENT_SYSTEM_PROMPT = """你是 CSCO 淋巴瘤诊疗指南（2025）问答的检索规划智能体。
@@ -163,6 +170,7 @@ EHA_SYSTEM_PROMPT = """你是欧洲血液学会(EHA)大B细胞淋巴瘤(LBCL)临
 4. 问题中的具体实体若证据未直接出现，应明确写明「指南未直接提及{实体}」。
 5. 禁止补充 EHA 证据以外的医学常识、预后推测或诊疗建议；不要引用 NCCN 页码（如 BCEL-x）或 CSCO 推荐等级体系。
 6. 文末不要列出来源或参考文献，来源由系统单独展示。
+7. 若提供「分子数据库证据」小节：指南证据用 [Sn]、分子证据用 [Mn]，不得混标；分子证据只作补充线索，不替代指南推荐。
 
 """ + eha_evidence_legend_prompt_block() + """
 
@@ -205,6 +213,37 @@ EHA_ROUTE_GUIDANCE = {
     ),
 }
 
+
+MOLECULAR_AGENT_SYSTEM_PROMPT = """你是分子证据检索智能体。你的任务是通过工具调用完成变异的坐标补全与证据检索，最终调用 finish_evidence_collection 结束。
+
+可用工具（按需自主决定顺序与次数）：
+- resolve_variant_coordinates(variant_id): 为 protein_level_only 或缺坐标的变异补转录本 / cDNA / 基因组坐标。已是 unique 的变异不要调用。
+- search_clinvar(variant_id): 查 ClinVar（胚系致病性/体细胞致癌性线索）— 必查
+- search_civic(variant_id): 查 CIViC（临床证据，含证据等级与疾病匹配）— 必查
+- search_myvariant(variant_id): 查 MyVariant.info（群体频率/功能预测/rsID）— 必查
+- search_gnomad(variant_id): 查 gnomAD 群体频率（AF/AC/AN，用于罕见度与 ACMG 频率证据）— 必查（需 SNV 基因组坐标；无坐标时仍需调用一次，返回空即视为已覆盖）
+- search_vep(variant_id): 查 Ensembl VEP 功能后果与计算预测（consequence/SIFT/PolyPhen/外显子）— 必查（需转录本+cDNA 或基因组 HGVS；无坐标时仍需调用一次，返回空即视为已覆盖）
+- finish_evidence_collection(reason): 证据足够时调用以结束，reason 说明覆盖情况与局限
+
+硬约束：
+1. 每个可检索变异必须查过全部 5 个库：ClinVar、CIViC、MyVariant、gnomAD、EnsemblVEP；gnomAD/VEP 无坐标时也要调用一次（空结果算已覆盖），不得以“按需”为由跳过。
+2. protein_level_only 的变异必须先 resolve 再 search，否则坐标不准。
+3. mapping_status 为 insufficient/ambiguous/conflicting 且无基因的变异不可检索，禁止对它们 search，直接在 finish 理由中提示需补充标准 HGVS。
+4. 不要编造 variant_id，只能使用消息中给定的 variant_id。
+5. 禁止直接输出临床结论（诊断/用药/预后）；结论由下游 SafetyGate 与 AnswerComposer 按规则生成。
+
+效率规则：
+- 同一 (variant_id, provider) 已查过则系统会去重返回缓存，不要重复调用。
+- 可在一轮中并行调用多个 search（如同时查 ClinVar + CIViC）；resolve 需串行。
+- 全部必查对覆盖后应尽快 finish，五库缺一不可，不要以“按需”为由跳过 MyVariant/gnomAD/VEP。
+
+示例轨迹（仅示意工具顺序，勿照抄 variant_id）：
+用户：变异 MYD88 p.L265P (protein_level_only, 无转录本)
+正确：resolve_variant_coordinates(var_abc) → search_clinvar(var_abc) + search_civic(var_abc) + search_myvariant(var_abc) 并行 → search_gnomad(var_abc) + search_vep(var_abc) → finish_evidence_collection("MYD88 已覆盖五库；gnomAD/VEP 结果已纳入")
+错误：直接 search_civic(var_abc) 而跳过 resolve；或对 insufficient 变异反复 search；或跳过 MyVariant/gnomAD/VEP 直接 finish。
+
+完成后仅通过工具结束，不要输出长文本。
+"""
 
 EVIDENCE_GATE_SYSTEM = """你是医学证据筛选助手。给定用户问题和若干条编号证据 [S1]..[Sn]，
 只返回与回答问题直接相关的证据编号 JSON，格式严格为：{"relevant": ["S1", "S3"]}
@@ -282,6 +321,56 @@ def _route_guidance(route: str, source_key: str = "nccn") -> str:
     return table.get(route, table["evidence"])
 
 
+MOLECULAR_CITATION_RULE = """分子证据引用规则（当「分子数据库证据」小节存在时适用）：
+1. 指南页/讨论段落用 [Sn] 标注，分子数据库证据用 [Mn] 标注（如 [M1]），两者不得混用。
+2. 分子证据来自外部数据库（CIViC / ClinVar / gnomAD / MyVariant / Ensembl VEP），不属于当前指南内容，
+   只能作为补充线索；不得用它替代指南的诊疗推荐，也不得据此给出用药或预后结论。
+3. 若证据卡带有安全边界提示，必须在回答中保留该提示。
+"""
+
+
+def _format_molecular_section(molecular: Optional[Dict[str, Any]]) -> str:
+    """Render molecular evidence as a prompt section with [Mn] citation indices."""
+    if not molecular:
+        return ""
+    variants = list(molecular.get("variants") or [])
+    evidence = list(molecular.get("evidence") or [])
+    if not variants and not evidence:
+        return ""
+    lines: List[str] = []
+    lines.append(
+        "分子数据库证据（来自 CIViC / ClinVar / gnomAD / MyVariant / Ensembl VEP，"
+        "非当前指南内容，引用请用 [Mn] 标号；不得据此给出诊疗或预后结论）："
+    )
+    for idx, variant in enumerate(variants, start=1):
+        gene = variant.get("gene") or "?"
+        hgvs = variant.get("protein_hgvs") or variant.get("cdna_hgvs") or variant.get("genomic_hgvs") or ""
+        mapping = variant.get("mapping_status") or ""
+        lines.append(f"[M{idx}] 变异：{gene} {hgvs}".strip() + (f" | 映射状态={mapping}" if mapping else ""))
+    base = len(variants)
+    for offset, card in enumerate(evidence, start=1):
+        idx = base + offset
+        title = card.get("source_title") or card.get("title") or card.get("provider") or "证据卡"
+        level = card.get("evidence_level") or ""
+        disease = card.get("disease") or ""
+        claim = card.get("claim") or card.get("summary") or ""
+        extra = " | ".join(part for part in (level, disease) if part)
+        lines.append(
+            f"[M{idx}] {card.get('provider', '')} {title}"
+            + (f" ({extra})" if extra else "")
+            + (f"\n    {claim}" if claim else "")
+        )
+    warnings = list(molecular.get("global_warnings") or [])
+    if warnings:
+        lines.append("安全边界：" + "；".join(str(w) for w in warnings))
+    if molecular.get("missing"):
+        lines.append(f"缺失信息：{molecular.get('missing')}")
+    provider_mode = molecular.get("provider_mode")
+    if provider_mode and provider_mode != "live":
+        lines.append(f"注意：本次分子检索为 {provider_mode} 模式，结果不可作为临床依据。")
+    return "\n".join(lines)
+
+
 def _format_page_info(hit: RetrievalHit) -> str:
     doc = hit.document
     return doc.printed_page_code or f"pdf_page={doc.pdf_page}"
@@ -293,7 +382,11 @@ def build_evidence_prompt(
     route: str = "evidence",
     *,
     source_key: str = "nccn",
+    molecular_evidence: Optional[Dict[str, Any]] = None,
 ) -> str:
+    molecular_evidence = molecular_evidence if molecular_evidence is not None else getattr(
+        bundle, "molecular_evidence", None
+    )
     evidence_blocks = []
     for idx, hit in enumerate(bundle.primary_hits, start=1):
         doc = hit.document
@@ -343,13 +436,18 @@ def build_evidence_prompt(
             + "\n".join(reference_lines)
         )
 
+    molecular_section = ""
+    if molecular_evidence:
+        molecular_section = "\n\n" + _format_molecular_section(molecular_evidence) + "\n" + MOLECULAR_CITATION_RULE
+
     return (
         f"{_route_guidance(route, source_key)}\n\n"
         f"{FEW_SHOT_EXAMPLE}\n"
         f"用户问题：{question}\n\n"
         f"可用证据（指南页与讨论段落，引用请仅用 [Sn]）：\n{evidence}"
         f"{graph_section}"
-        f"{reference_section}\n\n"
+        f"{reference_section}"
+        f"{molecular_section}\n\n"
         "请用中文按系统提示的结构回答。"
     )
 

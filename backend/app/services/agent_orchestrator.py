@@ -22,6 +22,7 @@ from backend.app.services.dlbcl_flow_map import (
     resolve_entry_page,
 )
 from backend.app.services.figure_selection import backfill_source_indices
+from backend.app.services.molecular_intent import MolecularIntent
 from backend.app.services.query_normalizer import normalize_query
 from backend.app.services.tracing import TraceLogger
 
@@ -53,12 +54,37 @@ class AgentOrchestrator:
         enable_vlm = bool(getattr(self.settings, "enable_vlm", True))
         enable_flowchart = bool(getattr(self.settings, "enable_flowchart", True))
         enable_kg = bool(getattr(self.settings, "enable_kg", True))
+        enable_molecular = bool(getattr(self.settings, "enable_molecular_evidence", True))
         allowed = {"search_guidelines", "respond_directly"}
         if enable_vlm and enable_flowchart:
             allowed.add("view_pages")
         if enable_kg:
             allowed.add("query_graph")
+        if enable_molecular:
+            allowed.add("molecular_evidence_lookup")
         return [t for t in TOOL_DEFINITIONS if t.get("function", {}).get("name") in allowed]
+
+    def _molecular_hint(self, intent: Optional[MolecularIntent]) -> Optional[str]:
+        """Tell the planner that molecular evidence is (or may be) relevant.
+
+        Deterministic intent detection already decided this before the loop,
+        so the planner should not spend steps rediscovering it.
+        """
+        if intent is None or not intent.should_hint:
+            return None
+        if intent.level == "strong":
+            return (
+                f"[系统提示] 已检测到分子变异意图（变异：{intent.variants_text}），"
+                "分子证据检索已由系统在后台并发执行，请勿重复调用 molecular_evidence_lookup；"
+                "请专注检索指南证据，最终回答可引用已返回的分子证据。"
+            )
+        return (
+            "[系统提示] 问题可能涉及分子变异（基因："
+            + "、".join(intent.genes or [])
+            + "），但未识别到标准 HGVS 写法。"
+            "如确认需要变异级证据可调用 molecular_evidence_lookup；"
+            "否则按指南问题正常检索，并在回答中提示可补充标准 HGVS 后做变异级检索。"
+        )
 
     def _should_upgrade_to_flowchart(self, state: AgentState) -> bool:
         """Upgrade evidence→flowchart only when flowchart intent is genuine.
@@ -86,6 +112,7 @@ class AgentOrchestrator:
         disease_scope: DiseaseScope,
         trace: TraceLogger,
         on_status: Optional[StatusCallback] = None,
+        molecular_intent: Optional[MolecularIntent] = None,
     ) -> AgentState:
         state = AgentState()
         emit = on_status or (lambda _e: None)
@@ -101,6 +128,9 @@ class AgentOrchestrator:
             )
 
         messages = self.qa.qwen.build_agent_messages(standalone, history)
+        hint = self._molecular_hint(molecular_intent)
+        if hint:
+            messages.append({"role": "system", "content": hint})
         max_steps = max(1, int(getattr(self.settings, "agent_max_steps", 4) or 4))
 
         for step_idx in range(max_steps):
@@ -208,6 +238,7 @@ class AgentOrchestrator:
         history: Sequence[dict],
         disease_scope: DiseaseScope,
         trace: TraceLogger,
+        molecular_intent: Optional[MolecularIntent] = None,
     ) -> Generator[Dict[str, Any], None, AgentState]:
         state = AgentState()
         yield status_event("planning", "规划中…")
@@ -224,6 +255,10 @@ class AgentOrchestrator:
             return state
 
         messages = self.qa.qwen.build_agent_messages(standalone, history)
+        hint = self._molecular_hint(molecular_intent)
+        if hint:
+            messages.append({"role": "system", "content": hint})
+            trace.log("molecular_hint_injected", {"level": molecular_intent.level if molecular_intent else None})
         max_steps = max(1, int(getattr(self.settings, "agent_max_steps", 4) or 4))
 
         for step_idx in range(max_steps):
@@ -350,6 +385,10 @@ class AgentOrchestrator:
             return self._tool_view_pages(args, state=state, standalone=standalone, trace=trace)
         if name == "respond_directly":
             return self._tool_respond_directly(args, state=state, question=standalone)
+        if name == "molecular_evidence_lookup":
+            if not bool(getattr(self.settings, "enable_molecular_evidence", True)):
+                return json.dumps({"ok": False, "error": "molecular_evidence_disabled"}, ensure_ascii=False)
+            return self._tool_molecular_evidence(args, state=state, trace=trace)
         return json.dumps({"error": f"unknown_tool:{name}"}, ensure_ascii=False)
 
     def _tool_search_guidelines(
@@ -676,6 +715,68 @@ class AgentOrchestrator:
         state.early_degraded = degraded
         state.route = "none"
         return f"已生成{kind}回复，无需继续检索。"
+
+    def _tool_molecular_evidence(
+        self,
+        args: Dict[str, Any],
+        *,
+        state: AgentState,
+        trace: TraceLogger,
+    ) -> str:
+        variants_text = str(args.get("variants_text") or "").strip()
+        if not variants_text:
+            return json.dumps({"ok": False, "error": "variants_text is required"}, ensure_ascii=False)
+        disease = str(args.get("disease") or "DLBCL").strip() or "DLBCL"
+        question = str(args.get("question") or "").strip() or None
+        provider_mode = str(args.get("provider_mode") or "").strip().lower() or None
+        # Main-QA default comes from config (default "mock" so variant questions
+        # never block on the network); the planner may still request live.
+        default_mode = str(
+            getattr(self.settings, "molecular_provider_mode_default", "mock") or "mock"
+        ).strip().lower()
+        if default_mode not in ("mock", "live", "hybrid"):
+            default_mode = "mock"
+        effective_mode = provider_mode or default_mode
+        try:
+            from backend.app.services.molecular_evidence import MolecularEvidenceService
+
+            service = MolecularEvidenceService(provider_mode=effective_mode)
+            result = service.analyze(
+                text=variants_text, disease=disease, sample_type="tumor tissue", question=question,
+            )
+            payload = result.to_dict()
+            # keep a compact summary on state for answer composition / trace
+            state.molecular_evidence = {
+                "provider_mode": payload.get("meta", {}).get("provider_mode"),
+                "agent_mode": payload.get("meta", {}).get("agent_mode"),
+                "variant_count": len(payload.get("variants", [])),
+                "evidence_count": len(payload.get("evidence", [])),
+                "summary": payload.get("summary"),
+                "variants": payload.get("variants", [])[:4],
+                "evidence": payload.get("evidence", [])[:6],
+                "missing": payload.get("missing"),
+                "global_warnings": payload.get("global_warnings", [])[:4],
+                "answer_snippet": (payload.get("answer", {}).get("markdown") or "")[:600],
+            }
+            trace.log("molecular_evidence", state.molecular_evidence)
+            # Return a compact but rich summary for the LLM to cite (without overloading context)
+            lines: list[str] = [
+                f"分子证据检索完成：识别 {len(payload.get('variants', []))} 个变异，检索到 {len(payload.get('evidence', []))} 条证据卡片。",
+            ]
+            for v in payload.get("variants", [])[:4]:
+                lines.append(f"- {v.get('gene')} {v.get('protein_hgvs') or v.get('cdna_hgvs') or ''} | {v.get('mapping_status')} | {v.get('disease_match') or v.get('genomic_hgvs') or ''}".strip())
+            if payload.get("summary", {}).get("priority_action"):
+                lines.append(f"处置优先级：{payload['summary']['priority_action']}")
+            if state.molecular_evidence.get("global_warnings"):
+                lines.append("边界：" + "；".join(state.molecular_evidence["global_warnings"]))
+            # Include a short answer snippet so the final LLM can reuse phrasing without re-inventing.
+            snippet = state.molecular_evidence.get("answer_snippet") or ""
+            if snippet:
+                lines.append(f"证据摘要：{snippet[:500]}")
+            return "\n".join(lines)
+        except Exception as exc:
+            trace.log("molecular_evidence_error", {"error": f"{type(exc).__name__}: {exc}"})
+            return json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False)
 
     def _linear_fallback(
         self,

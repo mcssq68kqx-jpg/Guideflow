@@ -73,6 +73,47 @@ AMINO_ACID_3_TO_1 = {
     "Ter": "*",
 }
 
+AMINO_ACID_1_TO_3 = {value: key for key, value in AMINO_ACID_3_TO_1.items()}
+AMINO_ACID_1_TO_3["*"] = "Ter"
+
+
+def protein_hgvs_to_3letter(protein_hgvs: Optional[str]) -> Optional[str]:
+    """Convert 1-letter protein HGVS (p.L265P) to the 3-letter form (p.Leu265P).
+
+    MyVariant.info snpeff annotations use 3-letter codes, so the fielded
+    ``/query`` lookup requires this form. Returns None when unparseable.
+    """
+    if not protein_hgvs:
+        return None
+    token = re.sub(r"^p\.", "", protein_hgvs.strip(), flags=re.IGNORECASE)
+    match = re.match(r"^([A-Z*])(\d+)([A-Z*]|Ter)$", token, flags=re.IGNORECASE)
+    if not match:
+        return None
+    ref, pos, alt = match.groups()
+    ref3 = AMINO_ACID_1_TO_3.get(ref.upper())
+    alt3 = AMINO_ACID_1_TO_3.get(alt.upper(), alt if alt.lower() == "ter" else None)
+    if not ref3 or not alt3:
+        return None
+    return f"p.{ref3}{pos}{alt3}"
+
+
+def myvariant_fielded_query(variant: "NormalizedVariant") -> Optional[str]:
+    """Build a fielded MyVariant.info /query string for one variant.
+
+    The ``/variant/hgvs/{GENE:p.V}`` endpoint does not accept gene-anchored
+    protein HGVS (it 404s), so both the provider and the resolver go through
+    ``/query`` with gene + snpeff consequence fields instead.
+    """
+    gene = (variant.gene or "").strip()
+    if not gene:
+        return None
+    protein3 = protein_hgvs_to_3letter(variant.protein_hgvs)
+    if protein3:
+        return f"dbnsfp.genename:{gene} AND snpeff.ann.hgvs_p:{protein3}"
+    if variant.cdna_hgvs:
+        return f"dbnsfp.genename:{gene} AND snpeff.ann.hgvs_c:{variant.cdna_hgvs}"
+    return None
+
 MOCK_KNOWLEDGE: dict[str, list[dict[str, Any]]] = {
     "MYD88|P.L265P": [
         {
@@ -255,6 +296,7 @@ class NormalizedVariant:
     unresolved_position: Optional[str] = None
     molecular_annotation: dict[str, Any] = field(default_factory=dict)
     enrichment: dict[str, Any] = field(default_factory=dict)
+    oncogenicity: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -960,6 +1002,120 @@ class MockEvidenceProvider:
         return list(dict.fromkeys(candidates))
 
 
+MOCK_POPULATION_ANNOTATION: dict[str, dict[str, Any]] = {
+    "MYD88|P.L265P": {"rsid": "rs387907274", "af": 1.2e-05, "consequence": "missense_variant", "sift": "deleterious", "polyphen": "probably_damaging"},
+    "CD79B|P.Y196H": {"rsid": "rs771727818", "af": 5.0e-05, "consequence": "missense_variant", "sift": "deleterious", "polyphen": "possibly_damaging"},
+    "TP53|P.R248Q": {"rsid": "rs11540652", "af": 1.0e-06, "consequence": "missense_variant", "sift": "deleterious", "polyphen": "probably_damaging"},
+}
+
+
+class MockGnomADProvider:
+    """Mock population-frequency annotation so mock/offline runs also cover gnomAD."""
+
+    provider_name = "gnomAD"
+
+    def search(self, variant: NormalizedVariant) -> list[RawEvidenceRecord]:
+        if variant.mapping_status in {"ambiguous", "insufficient", "conflicting"}:
+            return []
+        key = f"{variant.gene}|{(variant.protein_hgvs or '').upper()}"
+        annot = MOCK_POPULATION_ANNOTATION.get(key)
+        resolution = MOCK_RESOLUTION.get(key)
+        if not annot or not resolution:
+            return []
+        retrieved_at = utc_now_iso()
+        label = f"{variant.gene} {variant.protein_hgvs or ''}".strip()
+        af = float(annot["af"])
+        claim = (
+            f"gnomAD 群体频率（mock）：{label} 总体等位基因频率约 {af:.2e}（罕见）；"
+            f"dbSNP {annot['rsid']}。群体频率用于辅助判断变异罕见程度，不单独构成诊断或治疗结论。"
+        )
+        return [
+            RawEvidenceRecord(
+                provider=self.provider_name,
+                provider_record_id=f"MOCK-GNOMAD-{variant.gene}-{variant.protein_hgvs or 'NA'}",
+                provider_version="mock-mvp",
+                raw_response={
+                    "provider": self.provider_name,
+                    "provider_record_id": f"MOCK-GNOMAD-{variant.gene}-{variant.protein_hgvs or 'NA'}",
+                    "source_title": f"gnomAD mock annotation: {label}",
+                    "source_title_zh": f"gnomAD 群体频率（示例）：{label}",
+                    "source_url": "https://gnomad.broadinstitute.org/",
+                    "source_version": "mock-mvp",
+                    "access_status": "metadata_only",
+                    "evidence_type": "population frequency",
+                    "evidence_level": "L5",
+                    "disease": "unknown",
+                    "direction": "annotation",
+                    "record_status": "mock_accepted",
+                    "matched_variant": label,
+                    "claim": claim,
+                    "population": "gnomAD 参考人群汇总（mock），非 DLBCL 患者队列。",
+                    "intervention_and_outcome": "不适用；群体频率不构成治疗证据。",
+                    "applicability": "用于变异罕见程度判断与 ACMG BA1/BS1 类频率证据参考。",
+                    "limitations": "当前为 MVP mock 注释，正式解读前请用 live 模式核对实时频率。",
+                    "submission_conflict": False,
+                    "gnomad_af": af,
+                    "rsid": annot["rsid"],
+                },
+                retrieved_at=retrieved_at,
+            )
+        ]
+
+
+class MockVEPProvider:
+    """Mock functional-consequence annotation so mock/offline runs also cover VEP."""
+
+    provider_name = "EnsemblVEP"
+
+    def search(self, variant: NormalizedVariant) -> list[RawEvidenceRecord]:
+        if variant.mapping_status in {"ambiguous", "insufficient", "conflicting"}:
+            return []
+        key = f"{variant.gene}|{(variant.protein_hgvs or '').upper()}"
+        annot = MOCK_POPULATION_ANNOTATION.get(key)
+        resolution = MOCK_RESOLUTION.get(key)
+        if not annot or not resolution:
+            return []
+        retrieved_at = utc_now_iso()
+        label = f"{variant.gene} {variant.protein_hgvs or ''}".strip()
+        claim = (
+            f"Ensembl VEP 功能注释（mock）：{label} 转录本后果为 {annot['consequence']}；"
+            f"计算预测 SIFT {annot['sift']}、PolyPhen-2 {annot['polyphen']}。"
+            "VEP 后果与预测为计算注释，用于变异解读的辅助参考，不单独构成诊断或治疗结论。"
+        )
+        return [
+            RawEvidenceRecord(
+                provider=self.provider_name,
+                provider_record_id=f"MOCK-VEP-{variant.gene}-{variant.protein_hgvs or 'NA'}",
+                provider_version="mock-mvp",
+                raw_response={
+                    "provider": self.provider_name,
+                    "provider_record_id": f"MOCK-VEP-{variant.gene}-{variant.protein_hgvs or 'NA'}",
+                    "source_title": f"Ensembl VEP mock annotation: {label}",
+                    "source_title_zh": f"Ensembl VEP 功能注释（示例）：{label}",
+                    "source_url": "https://rest.ensembl.org/",
+                    "source_version": "mock-mvp",
+                    "access_status": "metadata_only",
+                    "evidence_type": "functional consequence / in-silico prediction",
+                    "evidence_level": "L5",
+                    "disease": "unknown",
+                    "direction": "annotation",
+                    "record_status": "mock_accepted",
+                    "matched_variant": label,
+                    "claim": claim,
+                    "population": "不适用；VEP 为转录本/蛋白层计算注释。",
+                    "intervention_and_outcome": "不适用；功能预测不构成治疗证据。",
+                    "applicability": "用于确定变异对蛋白编码的影响与优先级，需结合 ClinVar/CIViC 疾病特异证据。",
+                    "limitations": "当前为 MVP mock 注释，正式解读前请用 live 模式核对转录本与后果。",
+                    "submission_conflict": False,
+                    "consequence_terms": [str(annot["consequence"])],
+                    "sift_prediction": str(annot["sift"]),
+                    "polyphen_prediction": str(annot["polyphen"]),
+                },
+                retrieved_at=retrieved_at,
+            )
+        ]
+
+
 class ClinVarProvider:
     provider_name = "ClinVar"
     base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
@@ -1398,8 +1554,9 @@ def _nested_get(item: dict[str, Any], *path: str) -> Any:
 
 
 class MyVariantProvider:
-    """Optional extended source: aggregated variant annotation (rsID, population
-    frequency, functional predictions, ClinVar summary) via MyVariant.info."""
+    """Aggregated variant annotation (rsID, population frequency, functional
+    predictions, ClinVar summary) via the MyVariant.info ``/query`` endpoint
+    with gene + snpeff consequence fields."""
 
     provider_name = "MyVariant"
     base_url = "https://myvariant.info/v1"
@@ -1410,18 +1567,21 @@ class MyVariantProvider:
     def search(self, variant: NormalizedVariant) -> list[RawEvidenceRecord]:
         if variant.mapping_status in {"ambiguous", "insufficient", "conflicting"}:
             return []
-        query = self._build_query(variant)
+        query = myvariant_fielded_query(variant)
         if not query:
             return []
         retrieved_at = utc_now_iso()
         try:
             with httpx.Client(timeout=self.timeout_seconds, follow_redirects=True) as client:
-                response = client.get(f"{self.base_url}/variant/hgvs/{urllib.parse.quote(query, safe=':')}")
+                response = client.get(
+                    f"{self.base_url}/query",
+                    params={"q": query, "species": "human", "size": 5},
+                )
                 response.raise_for_status()
                 data = response.json()
         except Exception as exc:
             return [self._error_record(str(exc), retrieved_at)]
-        if isinstance(data, dict) and data.get("notfound"):
+        if isinstance(data, dict) and not data.get("hits"):
             return []
         records: list[RawEvidenceRecord] = []
         seen: set[str] = set()
@@ -1445,11 +1605,8 @@ class MyVariantProvider:
         return records
 
     def _build_query(self, variant: NormalizedVariant) -> Optional[str]:
-        if variant.protein_hgvs:
-            return f"{variant.gene}:{variant.protein_hgvs}"
-        if variant.cdna_hgvs:
-            return f"{variant.gene}:{variant.cdna_hgvs}"
-        return None
+        # Kept for backward compatibility; new code uses myvariant_fielded_query().
+        return myvariant_fielded_query(variant)
 
     def _normalize_hit(self, hit: dict[str, Any], variant: NormalizedVariant) -> Optional[dict[str, Any]]:
         if not hit:
@@ -1583,6 +1740,728 @@ class MyVariantProvider:
         )
 
 
+class GnomADProvider:
+    """Population frequency from gnomAD via GraphQL. Requires a resolved SNV
+    genomic coordinate (chr:g.POSREF>ALT); indels and protein-only inputs are
+    skipped because gnomAD is keyed by genomic locus."""
+
+    provider_name = "gnomAD"
+    base_url = "https://gnomad.broadinstitute.org/api"
+    _SNV_RE = re.compile(r"^chr(?P<chrom>[0-9XYM]+):g\.(?P<pos>\d+)(?P<ref>[ACGT])>(?P<alt>[ACGT])$", re.IGNORECASE)
+
+    def __init__(self, *, timeout_seconds: float = 12.0) -> None:
+        self.timeout_seconds = timeout_seconds
+
+    def search(self, variant: NormalizedVariant) -> list[RawEvidenceRecord]:
+        if variant.mapping_status in {"ambiguous", "insufficient", "conflicting"}:
+            return []
+        variant_id = self._to_variant_id(variant.genomic_hgvs)
+        if not variant_id:
+            return []
+        retrieved_at = utc_now_iso()
+        query = """
+            query VariantFreq($variantId: String!) {
+              variant: gnomad3_1_genomes(variantId: $variantId) {
+                ac an af homozygote_count filters
+              }
+            }
+        """
+        try:
+            with httpx.Client(timeout=self.timeout_seconds, follow_redirects=True) as client:
+                response = client.post(self.base_url, json={"query": query, "variables": {"variantId": variant_id}})
+                response.raise_for_status()
+                payload = response.json()
+        except Exception as exc:
+            return [self._error_record(str(exc), retrieved_at)]
+        data = (payload or {}).get("data") or {}
+        record_data = data.get("variant") or {}
+        if not record_data:
+            return []
+        af = record_data.get("af")
+        ac = record_data.get("ac")
+        an = record_data.get("an")
+        filters = record_data.get("filters") or []
+        claim_parts = [f"gnomAD 群体频率：{variant.gene} {variant.protein_hgvs or variant.cdna_hgvs or variant.genomic_hgvs or ''}"]
+        if isinstance(af, (int, float)):
+            tag = "极罕见" if af < 1e-5 else ("罕见" if af < 1e-3 else ("偏常见" if af < 1e-2 else "常见"))
+            claim_parts.append(f"总体等位基因频率约 {af:.2e}（{tag}）")
+        if ac is not None and an is not None:
+            claim_parts.append(f"等位基因计数 {ac}/{an}")
+        if filters:
+            claim_parts.append(f"过滤标记：{', '.join(str(f) for f in filters)}")
+        claim = "；".join(claim_parts) + "。群体频率用于辅助判断变异罕见程度，不单独构成诊断或治疗结论；常见多态通常不支持高外显致病变异假设。"
+        return [
+            RawEvidenceRecord(
+                provider=self.provider_name,
+                provider_record_id=f"gnomAD-{variant_id}",
+                provider_version="gnomAD GraphQL live",
+                raw_response={
+                    "provider": self.provider_name,
+                    "provider_record_id": f"gnomAD-{variant_id}",
+                    "source_title": f"gnomAD variant: {variant_id}",
+                    "source_title_zh": f"gnomAD 群体频率：{variant.gene} {variant.protein_hgvs or variant.genomic_hgvs or ''}",
+                    "source_url": f"https://gnomad.broadinstitute.org/variant/{variant_id}?dataset=gnomad_r3",
+                    "source_version": "gnomAD GraphQL live",
+                    "access_status": "metadata_only",
+                    "evidence_type": "population frequency",
+                    "evidence_level": "L5",
+                    "disease": "unknown",
+                    "direction": "annotation",
+                    "record_status": "live_metadata",
+                    "matched_variant": f"{variant.gene} {variant.protein_hgvs or variant.genomic_hgvs or ''}".strip(),
+                    "claim": claim,
+                    "population": "gnomAD 大规模参考人群（非 DLBCL 患者队列）。",
+                    "intervention_and_outcome": "不适用；群体频率不构成治疗证据。",
+                    "applicability": "用于变异罕见程度判断与 ACMG BA1/BS1 类频率证据参考。",
+                    "limitations": "gnomAD 频率来自参考人群，不能直接等同于疾病人群频率；indel 与嵌合需另行核验。",
+                    "submission_conflict": False,
+                    "gnomad_af": af if isinstance(af, (int, float)) else None,
+                    "gnomad_ac": ac,
+                    "gnomad_an": an,
+                },
+                retrieved_at=retrieved_at,
+            )
+        ]
+
+    def _to_variant_id(self, genomic_hgvs: Optional[str]) -> Optional[str]:
+        if not genomic_hgvs:
+            return None
+        match = self._SNV_RE.match(genomic_hgvs.strip())
+        if not match:
+            return None
+        chrom = match.group("chrom").upper()
+        return f"{chrom}-{match.group('pos')}-{match.group('ref').upper()}-{match.group('alt').upper()}"
+
+    def _error_record(self, error: str, retrieved_at: str) -> RawEvidenceRecord:
+        return RawEvidenceRecord(
+            provider=self.provider_name,
+            provider_record_id="GNOMAD_QUERY_ERROR",
+            provider_version="gnomAD GraphQL live",
+            raw_response={
+                "provider": self.provider_name,
+                "provider_record_id": "GNOMAD_QUERY_ERROR",
+                "source_title": "gnomAD query error",
+                "source_url": "https://gnomad.broadinstitute.org/",
+                "source_version": "gnomAD GraphQL live",
+                "access_status": "not_accessible",
+                "evidence_level": "L5",
+                "evidence_type": "query_error",
+                "disease": "unknown",
+                "record_status": "error",
+                "claim": "gnomAD 查询失败，不能据此形成群体频率结论。",
+                "population": "无法获取。",
+                "intervention_and_outcome": "无法获取。",
+                "applicability": "不能作为证据使用。",
+                "limitations": error,
+                "submission_conflict": False,
+            },
+            retrieved_at=retrieved_at,
+        )
+
+
+class EnsemblVEPProvider:
+    """Functional consequence and in-silico predictions from Ensembl VEP REST
+    (POST /vep/human/hgvs). Needs a transcript-anchored cDNA HGVS or a genomic HGVS."""
+
+    provider_name = "EnsemblVEP"
+    base_url = "https://rest.ensembl.org/vep/human/hgvs"
+
+    def __init__(self, *, timeout_seconds: float = 15.0) -> None:
+        self.timeout_seconds = timeout_seconds
+
+    def search(self, variant: NormalizedVariant) -> list[RawEvidenceRecord]:
+        if variant.mapping_status in {"ambiguous", "insufficient", "conflicting"}:
+            return []
+        hgvs = self._build_hgvs(variant)
+        if not hgvs:
+            return []
+        retrieved_at = utc_now_iso()
+        try:
+            with httpx.Client(timeout=self.timeout_seconds, follow_redirects=True) as client:
+                response = client.post(
+                    self.base_url,
+                    headers={"Content-Type": "application/json", "Accept": "application/json"},
+                    json={"hgvs_notations": [hgvs]},
+                )
+                response.raise_for_status()
+                data = response.json()
+        except Exception as exc:
+            return [self._error_record(str(exc), retrieved_at)]
+        hits = data if isinstance(data, list) else []
+        records: list[RawEvidenceRecord] = []
+        for hit in hits[:3]:
+            raw = self._normalize_hit(hit, variant, hgvs)
+            if not raw:
+                continue
+            records.append(
+                RawEvidenceRecord(
+                    provider=self.provider_name,
+                    provider_record_id=str(raw.get("provider_record_id") or f"VEP-{uuid.uuid4().hex[:8]}"),
+                    provider_version="Ensembl VEP REST live",
+                    raw_response=raw,
+                    retrieved_at=retrieved_at,
+                )
+            )
+        return records
+
+    def _build_hgvs(self, variant: NormalizedVariant) -> Optional[str]:
+        if variant.transcript and variant.cdna_hgvs:
+            return f"{variant.transcript}:{variant.cdna_hgvs}"
+        if variant.cdna_hgvs and ":" in variant.cdna_hgvs:
+            return variant.cdna_hgvs
+        if variant.genomic_hgvs:
+            return re.sub(r"^chr", "", variant.genomic_hgvs, flags=re.IGNORECASE)
+        return None
+
+    def _normalize_hit(self, hit: dict[str, Any], variant: NormalizedVariant, hgvs: str) -> Optional[dict[str, Any]]:
+        if not isinstance(hit, dict):
+            return None
+        consequences = hit.get("transcript_consequences") or []
+        picked = None
+        for cons in consequences:
+            if not isinstance(cons, dict):
+                continue
+            if variant.transcript and str(cons.get("transcript_id", "")).upper() == variant.transcript.split(".")[0].upper():
+                picked = cons
+                break
+            if picked is None:
+                picked = cons
+        consequence_terms = (picked or {}).get("consequence_terms") or hit.get("most_severe_consequence") or []
+        if isinstance(consequence_terms, str):
+            consequence_terms = [consequence_terms]
+        sift = (picked or {}).get("sift_prediction")
+        polyphen = (picked or {}).get("polyphen_prediction")
+        exon = (picked or {}).get("exon")
+        protein_pos = (picked or {}).get("protein_start")
+        amino_acids = (picked or {}).get("amino_acids")
+        impact = (picked or {}).get("impact")
+        label = f"{variant.gene} {variant.protein_hgvs or variant.cdna_hgvs or hgvs}"
+        claim_parts = [f"Ensembl VEP 功能注释：{label}"]
+        if consequence_terms:
+            claim_parts.append(f"转录本后果：{'、'.join(str(c) for c in consequence_terms[:4])}")
+        if impact:
+            claim_parts.append(f"影响分级：{impact}")
+        if exon:
+            claim_parts.append(f"位于外显子 {exon}")
+        if protein_pos and amino_acids:
+            claim_parts.append(f"蛋白位置 {protein_pos}（{amino_acids}）")
+        preds = []
+        if sift:
+            preds.append(f"SIFT {sift}")
+        if polyphen:
+            preds.append(f"PolyPhen-2 {polyphen}")
+        if preds:
+            claim_parts.append("计算预测：" + "；".join(preds))
+        claim = "；".join(claim_parts) + "。VEP 后果与预测为计算注释，用于变异解读的辅助参考，不单独构成诊断或治疗结论。"
+        return {
+            "provider": self.provider_name,
+            "provider_record_id": str(hit.get("id") or f"VEP-{hgvs}"),
+            "source_title": f"Ensembl VEP annotation: {hgvs}",
+            "source_title_zh": f"Ensembl VEP 功能注释：{label}",
+            "source_url": "https://rest.ensembl.org/documentation/info/vep_hgvs_post",
+            "source_version": "Ensembl VEP REST live",
+            "access_status": "metadata_only",
+            "evidence_type": "functional consequence / in-silico prediction",
+            "evidence_level": "L5",
+            "disease": "unknown",
+            "direction": "annotation",
+            "record_status": "live_metadata",
+            "matched_variant": label,
+            "claim": claim,
+            "population": "不适用；VEP 为转录本/蛋白层计算注释。",
+            "intervention_and_outcome": "不适用；功能预测不构成治疗证据。",
+            "applicability": "用于确定变异对蛋白编码的影响与优先级，需结合 ClinVar/CIViC 疾病特异证据。",
+            "limitations": "VEP 预测为算法推断，依赖转录本选择，不能替代实验验证与临床判断。",
+            "submission_conflict": False,
+            "consequence_terms": [str(c) for c in consequence_terms[:6]],
+            "sift_prediction": sift,
+            "polyphen_prediction": polyphen,
+        }
+
+    def _error_record(self, error: str, retrieved_at: str) -> RawEvidenceRecord:
+        return RawEvidenceRecord(
+            provider=self.provider_name,
+            provider_record_id="VEP_QUERY_ERROR",
+            provider_version="Ensembl VEP REST live",
+            raw_response={
+                "provider": self.provider_name,
+                "provider_record_id": "VEP_QUERY_ERROR",
+                "source_title": "Ensembl VEP query error",
+                "source_url": "https://rest.ensembl.org/",
+                "source_version": "Ensembl VEP REST live",
+                "access_status": "not_accessible",
+                "evidence_level": "L5",
+                "evidence_type": "query_error",
+                "disease": "unknown",
+                "record_status": "error",
+                "claim": "Ensembl VEP 查询失败，不能据此形成功能注释结论。",
+                "population": "无法获取。",
+                "intervention_and_outcome": "无法获取。",
+                "applicability": "不能作为证据使用。",
+                "limitations": error,
+                "submission_conflict": False,
+            },
+            retrieved_at=retrieved_at,
+        )
+
+
+class UniProtProvider:
+    """Protein function and domain annotation from UniProt REST (free, no key).
+
+    Answers "这个改变会不会破坏蛋白功能" at the protein level: reviewed
+    human entry preferred, function comment + domain/feature table surfaced as
+    an L5 annotation card. Also reports whether the variant position falls in
+    an annotated functional domain (feeds the oncogenicity scorer).
+    """
+
+    provider_name = "UniProt"
+    base_url = "https://rest.uniprot.org/uniprotkb/search"
+
+    def __init__(self, *, timeout_seconds: float = 12.0) -> None:
+        self.timeout_seconds = timeout_seconds
+
+    def search(self, variant: NormalizedVariant) -> list[RawEvidenceRecord]:
+        if variant.mapping_status in {"ambiguous", "insufficient", "conflicting"}:
+            return []
+        gene = (variant.gene or "").strip()
+        if not gene:
+            return []
+        retrieved_at = utc_now_iso()
+        try:
+            with httpx.Client(timeout=self.timeout_seconds, follow_redirects=True) as client:
+                response = client.get(
+                    self.base_url,
+                    params={
+                        "query": f"gene:{gene} AND organism_id:9606 AND reviewed:true",
+                        "fields": "accession,protein_name,gene_names,cc_function,cc_domain,ft_domain,sequence",
+                        "format": "json",
+                        "size": 1,
+                    },
+                    headers={"Accept": "application/json"},
+                )
+                response.raise_for_status()
+                data = response.json()
+        except Exception as exc:
+            return [self._error_record(str(exc), retrieved_at)]
+        results = (data or {}).get("results") or []
+        if not results or not isinstance(results[0], dict):
+            return []
+        entry = results[0]
+        return [
+            RawEvidenceRecord(
+                provider=self.provider_name,
+                provider_record_id=str(entry.get("primaryAccession") or f"UNIPROT-{gene}"),
+                provider_version="UniProt REST live",
+                raw_response=self._normalize_entry(entry, variant),
+                retrieved_at=retrieved_at,
+            )
+        ]
+
+    def _comments_text(self, entry: dict[str, Any], comment_type: str) -> list[str]:
+        texts: list[str] = []
+        for comment in entry.get("comments") or []:
+            if not isinstance(comment, dict) or comment.get("commentType") != comment_type:
+                continue
+            for text in comment.get("texts") or []:
+                value = text.get("value") if isinstance(text, dict) else text
+                if value:
+                    texts.append(str(value))
+        return texts
+
+    def _in_domain(self, entry: dict[str, Any], variant: NormalizedVariant) -> Optional[bool]:
+        position: Optional[int] = None
+        if variant.protein_hgvs:
+            match = re.match(r"^p\.[A-Z*](\d+)[A-Z*]$", variant.protein_hgvs.strip(), flags=re.IGNORECASE)
+            if match:
+                position = int(match.group(1))
+        if position is None:
+            return None
+        for feature in entry.get("features") or []:
+            if not isinstance(feature, dict):
+                continue
+            loc = feature.get("location") or {}
+            start = (loc.get("start") or {}).get("value")
+            end = (loc.get("end") or {}).get("value")
+            try:
+                if start is not None and end is not None and int(start) <= position <= int(end):
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
+    def _normalize_entry(self, entry: dict[str, Any], variant: NormalizedVariant) -> dict[str, Any]:
+        accession = str(entry.get("primaryAccession") or "")
+        functions = self._comments_text(entry, "FUNCTION")
+        function_zh = "；".join(functions[:2]) if functions else "UniProt 未提供功能注释。"
+        domains = self._comments_text(entry, "DOMAIN")
+        label = f"{variant.gene} {variant.protein_hgvs or variant.cdna_hgvs or ''}".strip()
+        in_domain = self._in_domain(entry, variant)
+        claim_parts = [f"UniProt 蛋白注释：{label} 对应条目 {accession}"]
+        if functions:
+            claim_parts.append(f"功能：{functions[0][:160]}")
+        if in_domain is True:
+            claim_parts.append("变异位点落在注释功能结构域内，提示可能影响蛋白功能")
+        elif in_domain is False:
+            claim_parts.append("变异位点未落在已注释功能结构域内")
+        claim = "；".join(claim_parts) + "。蛋白注释用于辅助判断变异的功能意义，不单独构成诊断或治疗结论。"
+        return {
+            "provider": self.provider_name,
+            "provider_record_id": accession or f"UNIPROT-{variant.gene}",
+            "source_title": f"UniProt entry: {accession}",
+            "source_title_zh": f"UniProt 蛋白注释：{variant.gene}（{accession}）",
+            "source_url": f"https://rest.uniprot.org/uniprotkb/{accession}.txt" if accession else "https://www.uniprot.org/",
+            "source_version": "UniProt REST live",
+            "access_status": "metadata_only",
+            "evidence_type": "protein function / domain",
+            "evidence_level": "L5",
+            "disease": "unknown",
+            "direction": "annotation",
+            "record_status": "live_metadata",
+            "matched_variant": label,
+            "claim": claim,
+            "population": "不适用；UniProt 为蛋白层知识库注释。",
+            "intervention_and_outcome": "不适用；蛋白注释不构成治疗证据。",
+            "applicability": "用于判断变异是否破坏蛋白功能域，需结合疾病特异性证据。",
+            "limitations": "UniProt 注释为知识库整理，不能替代实验验证与临床判断。",
+            "submission_conflict": False,
+            "uniprot_accession": accession or None,
+            "uniprot_function": function_zh,
+            "uniprot_domains": domains[:3],
+            "in_functional_domain": in_domain,
+        }
+
+    def _error_record(self, error: str, retrieved_at: str) -> RawEvidenceRecord:
+        return RawEvidenceRecord(
+            provider=self.provider_name,
+            provider_record_id="UNIPROT_QUERY_ERROR",
+            provider_version="UniProt REST live",
+            raw_response={
+                "provider": self.provider_name,
+                "provider_record_id": "UNIPROT_QUERY_ERROR",
+                "source_title": "UniProt query error",
+                "source_url": "https://www.uniprot.org/",
+                "source_version": "UniProt REST live",
+                "access_status": "not_accessible",
+                "evidence_level": "L5",
+                "evidence_type": "query_error",
+                "disease": "unknown",
+                "record_status": "error",
+                "claim": "UniProt 查询失败，不能据此形成功能注释结论。",
+                "population": "无法获取。",
+                "intervention_and_outcome": "无法获取。",
+                "applicability": "不能作为证据使用。",
+                "limitations": error,
+                "submission_conflict": False,
+            },
+            retrieved_at=retrieved_at,
+        )
+
+
+class OncoKBProvider:
+    """Clinical actionability from OncoKB (oncogenicity, hotspot, treatments).
+
+    Requires an OncoKB API token (free registration); set ONCOKB_TOKEN.
+    Without a token the provider reports itself as skipped (trace-visible)
+    instead of failing, so offline/CI runs stay green. Covers the
+    "是否已知致癌、有没有对应靶向药" and cancer-hotspot needs; COSMIC is
+    intentionally not integrated (license-gated).
+    """
+
+    provider_name = "OncoKB"
+    base_url = "https://www.oncokb.org/api/v1"
+
+    def __init__(self, *, timeout_seconds: float = 12.0, token: Optional[str] = None) -> None:
+        self.timeout_seconds = timeout_seconds
+        self.token = token if token is not None else os.getenv("ONCOKB_TOKEN")
+
+    def search(self, variant: NormalizedVariant) -> list[RawEvidenceRecord]:
+        if variant.mapping_status in {"ambiguous", "insufficient", "conflicting"}:
+            return []
+        if not self.token:
+            return []
+        alteration = self._alteration(variant)
+        if not alteration:
+            return []
+        retrieved_at = utc_now_iso()
+        try:
+            with httpx.Client(timeout=self.timeout_seconds, follow_redirects=True) as client:
+                response = client.get(
+                    f"{self.base_url}/annotate/mutations/byProteinChange",
+                    params={
+                        "hugoSymbol": variant.gene,
+                        "alteration": alteration,
+                        "tumorType": variant.disease,
+                    },
+                    headers={"Authorization": f"Bearer {self.token}", "Accept": "application/json"},
+                )
+                if response.status_code == 404:
+                    return []
+                response.raise_for_status()
+                data = response.json()
+        except Exception as exc:
+            return [self._error_record(str(exc), retrieved_at)]
+        if not isinstance(data, dict) or not data:
+            return []
+        return [
+            RawEvidenceRecord(
+                provider=self.provider_name,
+                provider_record_id=f"ONCOKB-{variant.gene}-{alteration}",
+                provider_version="OncoKB API live",
+                raw_response=self._normalize_annotation(data, variant, alteration),
+                retrieved_at=retrieved_at,
+            )
+        ]
+
+    def _alteration(self, variant: NormalizedVariant) -> Optional[str]:
+        if variant.protein_hgvs:
+            return re.sub(r"^p\.", "", variant.protein_hgvs.strip())
+        return None
+
+    def _normalize_annotation(self, data: dict[str, Any], variant: NormalizedVariant, alteration: str) -> dict[str, Any]:
+        oncogenicity = str(data.get("oncogenic") or data.get("oncogenicity") or "unknown")
+        hotspot = data.get("hotspot")
+        treatments: list[str] = []
+        for tx in data.get("treatments") or []:
+            if isinstance(tx, dict):
+                drugs = ", ".join(str(d.get("drugName") or d.get("name") or "") for d in (tx.get("drugs") or []) if isinstance(d, dict))
+                level = tx.get("level") or ""
+                if drugs:
+                    treatments.append(f"{drugs}（{level}）".strip("（）"))
+        label = f"{variant.gene} {variant.protein_hgvs or ''}".strip()
+        claim = (
+            f"OncoKB 临床注释：{label} 致癌性为 {oncogenicity}；"
+            f"{'是癌症热点突变；' if hotspot is True else ''}"
+            f"{'相关治疗：' + '；'.join(treatments[:3]) + '。' if treatments else '暂无 OncoKB 收录的对应靶向治疗。'}"
+            "OncoKB 注释用于临床可操作性判断，仍需结合指南与适应证。"
+        )
+        return {
+            "provider": self.provider_name,
+            "provider_record_id": f"ONCOKB-{variant.gene}-{alteration}",
+            "source_title": f"OncoKB annotation: {label}",
+            "source_title_zh": f"OncoKB 临床注释：{label}",
+            "source_url": "https://www.oncokb.org/",
+            "source_version": "OncoKB API live",
+            "access_status": "metadata_only",
+            "evidence_type": "clinical actionability / oncogenicity",
+            "evidence_level": "L3" if oncogenicity.lower() in {"oncogenic", "likely oncogenic"} else "L4",
+            "disease": variant.disease,
+            "drug": "; ".join(treatments[:3]) or None,
+            "direction": "database_record",
+            "record_status": "live_metadata",
+            "matched_variant": label,
+            "claim": claim,
+            "population": "OncoKB 知识库汇总，非单个患者队列。",
+            "intervention_and_outcome": "需核验 OncoKB 引用的原始治疗证据与适应证。",
+            "applicability": "用于判断是否存在对应靶向治疗线索；超出适应证用药需 MDT 与知情同意。",
+            "limitations": "OncoKB 注释不能替代指南与适应证核对；无 token 时该库自动跳过。",
+            "submission_conflict": False,
+            "oncokb_oncogenicity": oncogenicity,
+            "oncokb_hotspot": bool(hotspot) if hotspot is not None else None,
+            "oncokb_treatments": treatments[:5],
+        }
+
+    def _error_record(self, error: str, retrieved_at: str) -> RawEvidenceRecord:
+        return RawEvidenceRecord(
+            provider=self.provider_name,
+            provider_record_id="ONCOKB_QUERY_ERROR",
+            provider_version="OncoKB API live",
+            raw_response={
+                "provider": self.provider_name,
+                "provider_record_id": "ONCOKB_QUERY_ERROR",
+                "source_title": "OncoKB query error",
+                "source_url": "https://www.oncokb.org/",
+                "source_version": "OncoKB API live",
+                "access_status": "not_accessible",
+                "evidence_level": "L5",
+                "evidence_type": "query_error",
+                "disease": "unknown",
+                "record_status": "error",
+                "claim": "OncoKB 查询失败，不能据此形成可操作性结论。",
+                "population": "无法获取。",
+                "intervention_and_outcome": "无法获取。",
+                "applicability": "不能作为证据使用。",
+                "limitations": error,
+                "submission_conflict": False,
+            },
+            retrieved_at=retrieved_at,
+        )
+
+
+class PubMedProvider:
+    """Literature lookup via PubMed E-utilities (free, no key).
+
+    Gated: the service only calls this provider for variants whose
+    oncogenicity score >= 6 ("好钢用在刀刃上"). Returns abstract-level
+    leads (L4, downgraded by SafetyGate); never treatment conclusions.
+    """
+
+    provider_name = "PubMed"
+    base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+
+    def __init__(self, *, timeout_seconds: float = 10.0, max_records: int = 3) -> None:
+        self.timeout_seconds = timeout_seconds
+        self.max_records = max_records
+
+    def search(self, variant: NormalizedVariant) -> list[RawEvidenceRecord]:
+        if variant.mapping_status in {"ambiguous", "insufficient", "conflicting"}:
+            return []
+        site = variant.protein_hgvs or variant.cdna_hgvs or ""
+        if not variant.gene or not site:
+            return []
+        term = f"{variant.gene} {site} {variant.disease}".strip()
+        retrieved_at = utc_now_iso()
+        try:
+            with httpx.Client(timeout=self.timeout_seconds, follow_redirects=True) as client:
+                search_resp = client.get(
+                    f"{self.base_url}/esearch.fcgi",
+                    params={"db": "pubmed", "term": term, "retmode": "json", "retmax": self.max_records, "sort": "relevance"},
+                )
+                search_resp.raise_for_status()
+                ids = search_resp.json().get("esearchresult", {}).get("idlist", [])
+                if not ids:
+                    return []
+                summary_resp = client.get(
+                    f"{self.base_url}/esummary.fcgi",
+                    params={"db": "pubmed", "id": ",".join(ids), "retmode": "json"},
+                )
+                summary_resp.raise_for_status()
+                result = summary_resp.json().get("result", {})
+        except Exception as exc:
+            return [self._error_record(str(exc), retrieved_at)]
+        records: list[RawEvidenceRecord] = []
+        for uid in result.get("uids", [])[: self.max_records]:
+            item = result.get(uid, {})
+            if not isinstance(item, dict):
+                continue
+            records.append(
+                RawEvidenceRecord(
+                    provider=self.provider_name,
+                    provider_record_id=f"PMID{uid}",
+                    provider_version="PubMed E-utilities live",
+                    raw_response=self._normalize_summary(uid, item, variant),
+                    retrieved_at=retrieved_at,
+                )
+            )
+        return records
+
+    def _normalize_summary(self, uid: str, item: dict[str, Any], variant: NormalizedVariant) -> dict[str, Any]:
+        title = str(item.get("title") or f"PubMed record {uid}")
+        authors = ", ".join(
+            a.get("name", "") for a in (item.get("authors") or []) if isinstance(a, dict) and a.get("name")
+        )[:200]
+        journal = str(item.get("fulljournalname") or item.get("source") or "")
+        pubdate = str(item.get("pubdate") or "")
+        label = f"{variant.gene} {variant.protein_hgvs or variant.cdna_hgvs or ''}".strip()
+        return {
+            "provider": self.provider_name,
+            "provider_record_id": f"PMID{uid}",
+            "source_title": title,
+            "source_title_zh": f"文献线索：{label} 相关研究（PMID{uid}）",
+            "source_url": f"https://pubmed.ncbi.nlm.nih.gov/{uid}/",
+            "source_version": "PubMed E-utilities live",
+            "publication_or_release_date": pubdate or None,
+            "access_status": "abstract_only",
+            "evidence_type": "literature",
+            "evidence_level": "L4",
+            "disease": variant.disease,
+            "direction": "literature_lead",
+            "record_status": "live_metadata",
+            "review_status": "仅摘要，未核验全文",
+            "matched_variant": label,
+            "claim": f"PubMed 检索到 {label} 在{variant.disease}语境下的相关文献：{title[:160]}"
+            f"{'（' + authors + '）' if authors else ''}{'，发表于' + journal if journal else ''}。"
+            "该记录仅为文献线索，需核验全文的人群、方法与结论后才能引用。",
+            "population": "需核验原文入组人群。",
+            "intervention_and_outcome": "需核验原文干预与结局。",
+            "applicability": "仅在高积分变异（≥6 分）触发时检索，用于聚焦真正可疑的突变。",
+            "limitations": "仅获取摘要元数据，未做全文核验与质量评价；中低质量证据已按规则降级。",
+            "submission_conflict": False,
+        }
+
+    def _error_record(self, error: str, retrieved_at: str) -> RawEvidenceRecord:
+        return RawEvidenceRecord(
+            provider=self.provider_name,
+            provider_record_id="PUBMED_QUERY_ERROR",
+            provider_version="PubMed E-utilities live",
+            raw_response={
+                "provider": self.provider_name,
+                "provider_record_id": "PUBMED_QUERY_ERROR",
+                "source_title": "PubMed query error",
+                "source_url": "https://pubmed.ncbi.nlm.nih.gov/",
+                "source_version": "PubMed E-utilities live",
+                "access_status": "not_accessible",
+                "evidence_level": "L5",
+                "evidence_type": "query_error",
+                "disease": "unknown",
+                "record_status": "error",
+                "claim": "PubMed 查询失败，不能据此形成文献结论。",
+                "population": "无法获取。",
+                "intervention_and_outcome": "无法获取。",
+                "applicability": "不能作为证据使用。",
+                "limitations": error,
+                "submission_conflict": False,
+            },
+            retrieved_at=retrieved_at,
+        )
+
+
+class ClinGenAlleleRegistryResolver:
+    """Pre-resolver that normalizes any HGVS写法 to a stable ClinGen CA ID and
+    canonical genomic coordinate, so p.L265P / c.794T>C / chr3:g... all align to
+    the same allele before database lookups."""
+
+    resolver_name = "ClinGen Allele Registry"
+    base_url = "https://reg.genome.network/allele"
+
+    def __init__(self, *, timeout_seconds: float = 10.0) -> None:
+        self.timeout_seconds = timeout_seconds
+
+    def resolve(self, variant: NormalizedVariant) -> Optional[dict[str, Any]]:
+        hgvs = self._pick_hgvs(variant)
+        if not hgvs:
+            return None
+        try:
+            with httpx.Client(timeout=self.timeout_seconds, follow_redirects=True) as client:
+                response = client.get(
+                    self.base_url,
+                    params={"hgvs": hgvs},
+                    headers={"Accept": "application/json"},
+                )
+                if response.status_code == 404:
+                    return None
+                response.raise_for_status()
+                data = response.json()
+        except Exception:
+            # Registry unreachable / auth-gated: do not block downstream lookup.
+            return None
+        if not isinstance(data, dict):
+            return None
+        ca_id = str(data.get("id") or data.get("alleleRegistryId") or "").strip()
+        if not ca_id:
+            return None
+        result: dict[str, Any] = {
+            "source": self.resolver_name,
+            "query": hgvs,
+            "ca_id": ca_id,
+            "version": data.get("version"),
+            "warnings": [f"ClinGen Allele Registry 已将该写法归一为标准等位基因编号 {ca_id}，用于跨库对齐同一变异。"],
+        }
+        genomic = data.get("genomic") or data.get("locus")
+        if isinstance(genomic, str) and re.match(r"^(chr)?[0-9XYM]+:g\.", genomic, re.IGNORECASE):
+            result.setdefault("genomic_hgvs", genomic if genomic.lower().startswith("chr") else f"chr{genomic}")
+            result.setdefault("genome_build", "GRCh38")
+        return result
+
+    def _pick_hgvs(self, variant: NormalizedVariant) -> Optional[str]:
+        if variant.transcript and variant.cdna_hgvs:
+            return f"{variant.transcript}:{variant.cdna_hgvs}"
+        if variant.genomic_hgvs:
+            return variant.genomic_hgvs
+        if variant.cdna_hgvs and ":" in variant.cdna_hgvs:
+            return variant.cdna_hgvs
+        return None
+
+
 class CompositeEvidenceProvider:
     provider_name = "composite"
 
@@ -1676,7 +2555,7 @@ class MockVariantResolver:
 
 
 class MyVariantResolver:
-    """Live resolver via MyVariant.info HGVS endpoint (GRCh37 coordinates)."""
+    """Live resolver via the MyVariant.info ``/query`` endpoint (GRCh37 coordinates)."""
 
     resolver_name = "MyVariant.info"
     base_url = "https://myvariant.info/v1"
@@ -1685,12 +2564,15 @@ class MyVariantResolver:
         self.timeout_seconds = timeout_seconds
 
     def resolve(self, variant: NormalizedVariant) -> Optional[dict[str, Any]]:
-        query = self._build_query(variant)
+        query = myvariant_fielded_query(variant)
         if not query:
             return None
         try:
             with httpx.Client(timeout=self.timeout_seconds, follow_redirects=True) as client:
-                response = client.get(f"{self.base_url}/variant/hgvs/{urllib.parse.quote(query, safe=':')}")
+                response = client.get(
+                    f"{self.base_url}/query",
+                    params={"q": query, "species": "human", "size": 3},
+                )
                 response.raise_for_status()
                 data = response.json()
         except Exception as exc:
@@ -1700,7 +2582,7 @@ class MyVariantResolver:
                 "warnings": [f"在线坐标解析失败：{type(exc).__name__}: {exc}"],
                 "error": str(exc),
             }
-        if isinstance(data, dict) and data.get("notfound"):
+        if isinstance(data, dict) and not data.get("hits"):
             return None
         for hit in _extract_myvariant_hits(data):
             resolved = self._resolution_from_hit(hit, variant)
@@ -1721,6 +2603,10 @@ class MyVariantResolver:
 
     def _resolution_from_hit(self, hit: dict[str, Any], variant: NormalizedVariant) -> Optional[dict[str, Any]]:
         result: dict[str, Any] = {}
+        # /query hits carry the GRCh37 genomic coordinate as _id (e.g. chr3:g.38182641T>C).
+        hit_id = str(hit.get("_id") or "")
+        if re.match(r"^chr[^:]+:g\.", hit_id, re.IGNORECASE):
+            result.setdefault("genomic_hgvs", hit_id)
         raw = hit.get("hgvs")
         if isinstance(raw, str):
             entries = [raw]
@@ -1768,7 +2654,7 @@ class CompositeVariantResolver:
 class MolecularEvidenceAgent:
     """Deterministic agent that enriches variants then executes every required molecular database tool."""
 
-    REQUIRED_PROVIDERS = ("ClinVar", "CIViC")
+    REQUIRED_PROVIDERS = ("ClinVar", "CIViC", "MyVariant", "gnomAD", "EnsemblVEP")
 
     def __init__(
         self,
@@ -1938,6 +2824,129 @@ class MolecularEvidenceAgent:
         })
         return records, trace, status, resolver_status
 
+    def run_streaming(  # type: ignore[no-redef]
+        self,
+        variants: list[NormalizedVariant],
+        *,
+        question: Optional[str] = None,
+        trace: Optional[list[dict[str, Any]]] = None,
+    ):  # -> Generator[dict, None, tuple]
+        from typing import Generator as _Generator  # local to avoid top-level churn
+
+        trace = trace if trace is not None else []
+        trace.append({
+            "step": "plan",
+            "required_providers": list(self.required_providers),
+            "variant_count": len(variants),
+            "policy": "all_required_providers_must_be_queried",
+            "execution": "parallel",
+            "resolve_missing_coordinates": self.resolver is not None,
+            "agent": "deterministic",
+        })
+        yield {"type": "status", "stage": "planning", "label": "准备检索分子证据…", "detail": {"variant_count": len(variants)}}
+
+        status: dict[str, dict[str, Any]] = {
+            name: {"required": True, "queried": False, "query_count": 0, "record_count": 0, "error_count": 0, "state": "pending"}
+            for name in self.required_providers
+        }
+        resolver_status: dict[str, Any] = {
+            "enabled": self.resolver is not None,
+            "resolver": self.resolver.resolver_name if self.resolver is not None else None,
+            "queried": False,
+            "attempted_count": 0,
+            "resolved_count": 0,
+            "unresolved_count": 0,
+            "state": "disabled" if self.resolver is None else "pending",
+            "mode": "deterministic",
+        }
+        validator = MappingValidator()
+        if self.resolver is not None:
+            for variant in variants:
+                if not self._needs_enrichment(variant):
+                    continue
+                yield {"type": "status", "stage": "molecular_tool", "label": f"补全坐标：{variant.gene} {variant.protein_hgvs or ''}", "detail": {"tool": "resolve_variant_coordinates", "variant_id": variant.variant_id}}
+                resolver_status["queried"] = True
+                resolver_status["attempted_count"] += 1
+                resolved = self.resolver.resolve(variant)
+                if resolved:
+                    self._apply_resolution(variant, resolved)
+                    validator.validate(variant)
+                    resolver_status["resolved_count"] += 1
+                    entry = {"step": "resolve_variant", "resolver": self.resolver.resolver_name, "variant_id": variant.variant_id, "variant": self._variant_label(variant), "status": "resolved", "mapping_status": variant.mapping_status, "resolved_fields": variant.enrichment.get("resolved_fields", {})}
+                    trace.append(entry)
+                    yield {"type": "tool_result", "tool": "resolve_variant_coordinates", "arguments": {"variant_id": variant.variant_id}, "result": entry, "stage": "resolve"}
+                else:
+                    resolver_status["unresolved_count"] += 1
+                    entry = {"step": "resolve_variant", "resolver": self.resolver.resolver_name, "variant_id": variant.variant_id, "variant": self._variant_label(variant), "status": "unresolved", "mapping_status": variant.mapping_status}
+                    trace.append(entry)
+                    yield {"type": "tool_result", "tool": "resolve_variant_coordinates", "arguments": {"variant_id": variant.variant_id}, "result": entry, "stage": "resolve"}
+            if resolver_status["queried"]:
+                resolver_status["state"] = "resolved" if resolver_status["resolved_count"] else "unresolved"
+
+        tasks = [(variant, provider) for variant in variants for provider in self.providers]
+        records: list[RawEvidenceRecord] = []
+        seen_records: set[tuple[str, str]] = set()
+        if tasks:
+            for variant, provider in tasks:
+                yield {"type": "status", "stage": "molecular_tool", "label": f"查询 {provider.provider_name}：{variant.gene}", "detail": {"tool": f"search_{provider.provider_name.lower()}", "variant_id": variant.variant_id, "provider": provider.provider_name}}
+            # still execute in parallel for speed, but stream results as they arrive
+            outcomes: list[tuple[NormalizedVariant, Any, list[RawEvidenceRecord], Optional[str]]] = []
+            with ThreadPoolExecutor(max_workers=min(8, len(tasks))) as executor:
+                futures = {executor.submit(provider.search, variant): (variant, provider) for variant, provider in tasks}
+                for future in as_completed(futures):
+                    variant, provider = futures[future]
+                    try:
+                        recs = future.result()
+                        outcomes.append((variant, provider, recs, None))
+                    except Exception as exc:
+                        outcomes.append((variant, provider, [], f"{type(exc).__name__}: {exc}"))
+            outcomes.sort(key=lambda x: (x[0].variant_id, x[1].provider_name))
+            for variant, provider, provider_records, exception_text in outcomes:
+                provider_name = provider.provider_name
+                st = status.setdefault(provider_name, {"required": provider_name in self.required_providers, "queried": False, "query_count": 0, "record_count": 0, "error_count": 0, "state": "pending"})
+                st["queried"] = True
+                st["query_count"] += 1
+                error_count = 1 if exception_text else 0
+                usable_count = 0
+                duplicate_count = 0
+                for record in provider_records:
+                    record.raw_response.setdefault("variant_id", variant.variant_id)
+                    is_error = self._is_error_record(record)
+                    error_count += int(is_error)
+                    if is_error:
+                        records.append(record)
+                        continue
+                    key = (record.provider, record.provider_record_id)
+                    if key in seen_records:
+                        duplicate_count += 1
+                        continue
+                    seen_records.add(key)
+                    records.append(record)
+                    usable_count += 1
+                st["record_count"] += usable_count
+                st["error_count"] += error_count
+                entry = {"step": "query_provider", "provider": provider_name, "variant_id": variant.variant_id, "variant": self._variant_label(variant), "queried": True, "record_count": usable_count, "duplicate_count": duplicate_count, "error_count": error_count, "error": exception_text}
+                trace.append(entry)
+                yield {"type": "tool_result", "tool": f"search_{provider_name.lower()}", "arguments": {"variant_id": variant.variant_id}, "result": entry, "stage": "search"}
+
+        for provider_name, st in status.items():
+            expected = len(variants) if st["required"] else 0
+            if st["query_count"] < expected:
+                st["state"] = "incomplete"
+            elif st["error_count"]:
+                st["state"] = "degraded"
+            elif st["record_count"] == 0:
+                st["state"] = "no_evidence"
+            else:
+                st["state"] = "success"
+        incomplete = [n for n in self.required_providers if status[n]["state"] == "incomplete"]
+        if incomplete:
+            raise RuntimeError(f"required molecular providers were not fully queried: {', '.join(incomplete)}")
+        degraded = any(status[n]["state"] == "degraded" for n in self.required_providers)
+        trace.append({"step": "complete", "required_providers_queried": True, "completion_state": "degraded" if degraded else "complete", "resolver": resolver_status, "providers": status, "agent": "deterministic"})
+        yield {"type": "status", "stage": "complete", "label": "检索完成，生成证据卡片中…", "detail": {"record_count": len(records)}}
+        return records, trace, status, resolver_status  # type: ignore[return-value]
+
     def _needs_enrichment(self, variant: NormalizedVariant) -> bool:
         """A variant needs coordinate resolution when it is missing resolvable fields.
 
@@ -1962,11 +2971,18 @@ class MolecularEvidenceAgent:
             for field in ("protein_hgvs", "cdna_hgvs", "genomic_hgvs", "genome_build", "transcript")
             if getattr(variant, field)
         }
+        enrichment_extra: dict[str, Any] = {}
+        if resolved.get("ca_id"):
+            resolved_fields["ca_id"] = str(resolved.get("ca_id"))
+            enrichment_extra["ca_id"] = str(resolved.get("ca_id"))
+            if resolved.get("version"):
+                enrichment_extra["ca_version"] = resolved.get("version")
         variant.enrichment = {
             "source": resolved.get("source") or (self.resolver.resolver_name if self.resolver else "unknown"),
             "query": resolved.get("query") or variant.raw_input,
             "resolved_fields": resolved_fields,
             "warnings": resolved.get("warnings") or [],
+            **enrichment_extra,
         }
 
     def _is_error_record(self, record: RawEvidenceRecord) -> bool:
@@ -2334,7 +3350,7 @@ class AnswerComposer:
         global_warnings: list[str],
         question: Optional[str] = None,
     ) -> tuple[str, dict[str, Any]]:
-        direct = "已完成变异标准化、证据检索、证据卡生成、疾病匹配和安全门控。" if cards else "当前输入未检索到可进入证据卡的记录，或变异信息不足以支持确定性查询。"
+        no_card_note = "当前输入未检索到可进入证据卡的记录，或变异信息不足以支持确定性查询。"
         decision_bucket = "allow"
         if any(g.decision in {"ask_for_confirmation", "refuse"} for g in gates):
             decision_bucket = "confirm"
@@ -2347,9 +3363,10 @@ class AnswerComposer:
             lines.append("当前证据可用于线索性解释，但证据强度有限，建议结合病理和临床背景再判断。")
         else:
             lines.append("当前证据可用于分子层面的临床解释，但仍需结合病理、免疫表型和治疗背景综合判断。")
-        lines.append(direct)
+        if not cards:
+            lines.append(no_card_note)
         intents = self._question_intents(question)
-        if intents:
+        if intents and intents != ["综合临床意义"]:
             lines.extend(["", f"本次重点：{'、'.join(intents)}。"])
         lines.extend(self._clinical_question_answer(variants=variants, cards=cards, intents=intents))
         lines.append("")
@@ -2357,7 +3374,7 @@ class AnswerComposer:
         lines.extend(["", "## 适用范围"])
         for variant in variants:
             label = " ".join(item for item in [variant.gene, variant.protein_hgvs or variant.cdna_hgvs or variant.genomic_hgvs or variant.unresolved_position or "未明确位点"] if item)
-            lines.append(f"- {label}：肿瘤类型 {variant.disease}，样本类型 {variant.sample_type or '未提供'}，映射状态 {variant.mapping_status}。")
+            lines.append(f"- {label}：{variant.disease}／样本 {variant.sample_type or '未提供'}／映射 {variant.mapping_status}")
             if variant.warnings:
                 lines.append(f"  - 解析提示：{'；'.join(variant.warnings)}")
         lines.extend(["", "## 分子生物学解析"])
@@ -2365,20 +3382,15 @@ class AnswerComposer:
             ann = getattr(variant, "molecular_annotation", {}) or {}
             label = " ".join(item for item in [variant.gene or "未识别基因", variant.protein_hgvs or variant.cdna_hgvs or variant.genomic_hgvs or variant.unresolved_position or "未明确位点"] if item)
             lines.append(f"- {label}")
-            lines.append(f"  - 突变类型：{ann.get('variant_type') or variant.variant_type or 'unknown'}；外显子/结构相关性：{ann.get('exon_relevance') or 'unknown'}")
-            lines.append(f"  - 蛋白影响：{ann.get('protein_impact_note') or '当前证据不足'}；预测效应：{ann.get('protein_effect') or 'unknown'}")
+            lines.append(
+                f"  - 分子特征：{ann.get('variant_type') or variant.variant_type or 'unknown'}；位点 {ann.get('exon_relevance') or 'unknown'}；"
+                f"蛋白影响 {str(ann.get('protein_impact_note') or '当前证据不足').rstrip('。')}；预测效应 {ann.get('protein_effect') or 'unknown'}"
+            )
             lines.append(f"  - 基因属性：{ann.get('gene_role') or 'unknown'}；肿瘤效应：{ann.get('oncology_effect') or 'unknown'}")
-            if ann.get('upstream_pathways'):
-                lines.append(f"  - 上游通路：{'；'.join(ann.get('upstream_pathways') or [])}")
             if ann.get('downstream_pathways'):
                 lines.append(f"  - 下游通路：{'；'.join(ann.get('downstream_pathways') or [])}")
-            if ann.get('go_terms'):
-                lines.append(f"  - GO/KEGG/GSEA 功能归类：{'；'.join(ann.get('go_terms') or [])}")
             if ann.get('targetability'):
                 lines.append(f"  - 靶向线索：{'；'.join(ann.get('targetability') or [])}")
-            lines.append(f"  - 数据库分型提示：{ann.get('database_class_hint') or 'context_dependent'}")
-        lines.extend(["", "## 分子诊断报告模板"])
-        lines.extend(self._build_report_template(variants=variants, cards=cards, decision_bucket=decision_bucket))
         lines.extend(["", "## 缺失信息"])
         if missing_information:
             lines.extend(f"- {item}" for item in missing_information)
@@ -2457,9 +3469,6 @@ class AnswerComposer:
             lines.append("- 证据匹配：当前证据以相近疾病或外推记录为主，不宜直接用于当前患者决策。")
         else:
             lines.append("- 证据匹配：当前未形成可展示证据卡，不能把未检索到记录解释为变异无临床意义。")
-        if variants:
-            lines.append("- 随访与验证建议：治疗过程中建议动态复查相关指标；对关键变异可考虑重复检测或采用正交方法（如 ddPCR、Sanger 测序）验证，以减少批次或平台误差。")
-            lines.append("- 多学科讨论建议：建议将本次分子证据作为会诊材料之一，最终诊断与治疗决策由病理科、血液科/肿瘤科等多学科团队共同确认。")
         return lines
 
     def _clinical_general_suggestions(
@@ -2471,25 +3480,12 @@ class AnswerComposer:
         decision_bucket: str,
     ) -> list[str]:
         lines: list[str] = ["## 一般建议"]
-        genes = {variant.gene.upper() for variant in variants if variant.gene}
         if decision_bucket == "confirm":
-            lines.append("- 当前至少存在一项需要医生确认或阻断的安全门控结果，建议优先复核原始报告、转录本、参考基因组版本与样本来源，再进入患者级解释。")
-        elif decision_bucket == "downgrade":
-            lines.append("- 当前结果可作为线索性证据使用，但证据强度有限，建议结合病理、免疫表型和临床背景综合判断。")
-        else:
-            lines.append("- 当前结果可用于分子层面的临床解释，但仍需结合病理、免疫表型和治疗背景综合判断。")
+            lines.append("- 存在需医生确认或阻断的门控结果，建议先复核原始报告、转录本与参考基因组版本。")
         if variants:
             labels = "、".join(dict.fromkeys(variant.gene for variant in variants if variant.gene))
             lines.append(f"- 建议优先关注：{labels} 的标准 HGVS、转录本和参考基因组版本是否一致。")
-        if "诊断与分型" in intents and {"MYD88", "CD79B"}.issubset(genes):
-            lines.append("- 诊断与分型：MYD88 与 CD79B 的组合可提示 BCR/TLR–NF-κB 相关分子特征，但不能替代完整分型算法。")
-        if "治疗与可操作性" in intents:
-            lines.append("- 治疗：请优先核对同癌种、同适应证的证据，再判断是否存在可操作治疗线索。")
-        if "补充检测" in intents:
-            lines.append("- 补充检测：如关键信息缺失，建议补充 IHC、FISH、正交验证或复测以减少平台差异。")
-        if cards:
-            lines.append(f"- 当前已形成 {len(cards)} 条证据卡，可继续按证据等级和疾病匹配度筛选。")
-        else:
+        if not cards:
             lines.append("- 当前未形成可展示证据卡，不应将“未检出”解释为“无临床意义”。")
         lines.append("- 所有输出仅用于辅助阅读与证据组织，最终结论仍需由临床医生结合原始检测报告确认。")
         return lines
@@ -2508,8 +3504,11 @@ class AnswerComposer:
         primary_card = next((card for card in cards if self._is_displayable_card(card)), None)
         for idx, variant in enumerate(variants, start=1):
             ann = getattr(variant, "molecular_annotation", {}) or {}
+            onco = getattr(variant, "oncogenicity", {}) or {}
             label = " ".join(item for item in [variant.gene or "未识别基因", variant.protein_hgvs or variant.cdna_hgvs or variant.genomic_hgvs or variant.unresolved_position or "未明确位点"] if item)
             lines.append(f"- 模板 {idx}：{label}")
+            if onco:
+                lines.append(f"  - 致癌性积分：{onco.get('score', '?')} 分（{onco.get('tier_zh', '')}，{onco.get('tier', '')}）；证据不足默认 VUS，不硬判")
             lines.append(f"  - 变异类型：{ann.get('variant_type') or variant.variant_type or 'unknown'}；位点性质：{ann.get('exon_relevance') or 'unknown'}")
             lines.append(f"  - 蛋白层判断：{ann.get('protein_impact_note') or '当前证据不足'}")
             lines.append(f"  - 功能属性：{ann.get('gene_role') or 'unknown'}；肿瘤作用：{ann.get('oncology_effect') or 'unknown'}")
@@ -2722,28 +3721,117 @@ class MolecularEvidenceService:
         provider: Optional[EvidenceProvider] = None,
         *,
         provider_mode: Optional[ProviderMode] = None,
-        agent: Optional[MolecularEvidenceAgent] = None,
+        agent: Optional[Any] = None,
         resolver: Optional[VariantResolver] = None,
+        agent_mode: Optional[str] = None,
     ) -> None:
         self.parser = MolecularInputParser()
         self.provider_mode = (provider_mode or os.getenv("MOLECULAR_EVIDENCE_PROVIDER_MODE", "live")).strip().lower()
+        # agent_mode: deterministic = old workflow, llm = true agent, auto = llm when possible (default)
+        raw_agent_mode = (agent_mode or os.getenv("MOLECULAR_AGENT_MODE") or os.getenv("MOLECULAR_EVIDENCE_AGENT") or "auto").strip().lower()
+        if raw_agent_mode not in {"deterministic", "llm", "auto"}:
+            raw_agent_mode = "auto"
+        # mock 模式固定走确定性分支，保证离线测试与演示稳定
+        if self.provider_mode == "mock":
+            raw_agent_mode = "deterministic"
+        self.agent_mode_requested = raw_agent_mode
         self.resolver = resolver or self._build_resolver(self.provider_mode)
-        self.agent = agent or MolecularEvidenceAgent(
-            provider_mode=self.provider_mode,
-            providers=self._build_agent_providers(self.provider_mode, provider),
-            resolver=self.resolver,
-        )
+        self._providers_for_agent = self._build_agent_providers(self.provider_mode, provider)
+        self.agent: Any
+        self.agent_mode_effective: str = "deterministic"
+        if agent is not None:
+            self.agent = agent
+            self.agent_mode_effective = getattr(agent, "provider_mode", "deterministic")
+            # tag llm agents so audit is self-describing
+            if agent.__class__.__name__ == "MolecularLLMAgent":
+                self.agent_mode_effective = "llm"
+        elif raw_agent_mode == "deterministic":
+            self.agent = MolecularEvidenceAgent(
+                provider_mode=self.provider_mode,
+                providers=self._providers_for_agent,
+                resolver=self.resolver,
+            )
+            self.agent_mode_effective = "deterministic"
+        elif raw_agent_mode in {"llm", "auto"}:
+            llm_agent = self._try_build_llm_agent()
+            if llm_agent is not None:
+                self.agent = llm_agent
+                self.agent_mode_effective = "llm"
+            else:
+                # auto 降级到确定性；显式 llm 但无 key 时也在运行时降级（trace 会记录原因）
+                if raw_agent_mode == "llm":
+                    # still build llm agent — it will fallback at run() time and emit a trace
+                    llm_agent2 = self._try_build_llm_agent(force_without_key=True)
+                    if llm_agent2 is not None:
+                        self.agent = llm_agent2
+                        self.agent_mode_effective = "llm"
+                    else:
+                        self.agent = MolecularEvidenceAgent(
+                            provider_mode=self.provider_mode,
+                            providers=self._providers_for_agent,
+                            resolver=self.resolver,
+                        )
+                else:
+                    self.agent = MolecularEvidenceAgent(
+                        provider_mode=self.provider_mode,
+                        providers=self._providers_for_agent,
+                        resolver=self.resolver,
+                    )
         self.builder = EvidenceCardBuilder()
         self.safety_gate = SafetyGate()
         self.answer_composer = AnswerComposer()
+
+    def _get_qwen_client(self) -> Optional[Any]:
+        api_key = (
+            os.getenv("QWEN_API_KEY")
+            or os.getenv("QWEN_APIKEY")
+            or os.getenv("DASHSCOPE_API_KEY")
+            or os.getenv("DASHSCOPE_APIKEY")
+            or os.getenv("ALIYUN_API_KEY")
+            or os.getenv("DEEPSEEK_API_KEY")
+            or os.getenv("DEEPSEEK_APIKEY")
+        )
+        if not api_key:
+            return None
+        base_url = os.getenv("QWEN_BASE_URL") or os.getenv("DEEPSEEK_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        model = os.getenv("QWEN_MODEL") or os.getenv("DEEPSEEK_MODEL") or "qwen-plus"
+        try:
+            from backend.app.services.qwen import QwenClient
+
+            return QwenClient(api_key, base_url.rstrip("/"), model, source_key="nccn")
+        except Exception:
+            return None
+
+    def _try_build_llm_agent(self, *, force_without_key: bool = False) -> Optional[Any]:
+        try:
+            from backend.app.services.molecular_agent_llm import MolecularLLMAgent
+        except Exception:
+            return None
+        qwen_client: Optional[Any] = self._get_qwen_client()
+        if qwen_client is None and not force_without_key:
+            return None
+        # force_without_key: build with None so run() can emit a deterministic fallback trace
+        max_steps = int(os.getenv("MOLECULAR_AGENT_MAX_STEPS") or os.getenv("AGENT_MAX_STEPS") or "8")
+        try:
+            return MolecularLLMAgent(
+                qwen_client=qwen_client,
+                providers=self._providers_for_agent,
+                resolver=self.resolver,
+                max_steps=max_steps,
+            )
+        except Exception:
+            return None
 
     def _build_resolver(self, provider_mode: Optional[str]) -> Optional[VariantResolver]:
         mode = (provider_mode or os.getenv("MOLECULAR_EVIDENCE_PROVIDER_MODE", "live")).strip().lower()
         if mode == "mock":
             return MockVariantResolver()
+        # live/hybrid: ClinGen Allele Registry first for a stable CA ID + canonical
+        # locus (p./c./g.写法对齐), then MyVariant for coordinates; hybrid adds mock fallback.
+        chain: list[VariantResolver] = [ClinGenAlleleRegistryResolver(), MyVariantResolver()]
         if mode == "hybrid":
-            return CompositeVariantResolver([MyVariantResolver(), MockVariantResolver()])
-        return MyVariantResolver()
+            chain.append(MockVariantResolver())
+        return CompositeVariantResolver(chain)
 
     def _build_agent_providers(
         self, provider_mode: Optional[str], provider: Optional[EvidenceProvider]
@@ -2759,8 +3847,16 @@ class MolecularEvidenceService:
                 _ProviderView(mock, "ClinVar"),
                 _ProviderView(mock, "CIViC"),
                 _ProviderView(mock, "MyVariant"),
+                MockGnomADProvider(),
+                MockVEPProvider(),
             ]
-        providers: list[EvidenceProvider] = [ClinVarProvider(), CivicProvider(), MyVariantProvider()]
+        providers: list[EvidenceProvider] = [
+            ClinVarProvider(),
+            CivicProvider(),
+            MyVariantProvider(),
+            GnomADProvider(),
+            EnsemblVEPProvider(),
+        ]
         if mode == "hybrid":
             providers.append(MockEvidenceProvider())
         return providers
@@ -2811,9 +3907,10 @@ class MolecularEvidenceService:
             "question": question,
             "provider_mode": self.provider_mode,
         }
-        required_providers = list(self.agent.required_providers)
+        required_providers = list(getattr(self.agent, "required_providers", MolecularEvidenceAgent.REQUIRED_PROVIDERS))
+        agent_providers = getattr(self.agent, "providers", self._providers_for_agent)
         extended_providers = sorted(
-            {provider.provider_name for provider in self.agent.providers} - set(required_providers)
+            {provider.provider_name for provider in agent_providers} - set(required_providers)
         )
         query = {
             "question": question,
@@ -2823,8 +3920,15 @@ class MolecularEvidenceService:
             "transcript": transcript,
             "variant_type": variant_type,
             "provider_mode": self.provider_mode,
+            "agent_mode": self.agent_mode_effective,
+            "agent_mode_requested": self.agent_mode_requested,
         }
-        cache_key = self._make_cache_key(text=text, disease=disease, sample_type=sample_type, genome_build=genome_build, transcript=transcript, variant_type=variant_type, provider_name=f"{self.provider_mode}:providers-v9-structured-zh")
+        # Include agent mode in cache partitioning so llm/deterministic results do not collide;
+        # also bump the version string so existing v9 entries do not shadow the new paths.
+        cache_key = self._make_cache_key(
+            text=text, disease=disease, sample_type=sample_type, genome_build=genome_build,
+            transcript=transcript, variant_type=variant_type, provider_name=f"{self.provider_mode}:{self.agent_mode_effective}:providers-v12-oncoscore",
+        )
         cached = self._load_cache(cache_key)
         if cached is not None:
             result = self._result_from_payload(cached, cache_hit=True, cache_key=cache_key)
@@ -2850,55 +3954,257 @@ class MolecularEvidenceService:
             transcript=transcript,
             variant_type=variant_type,
         )
-        raw_records, agent_trace, provider_status, resolver_status = self.agent.run(variants)
-        cards: list[EvidenceCard] = []
-        gates: list[SafetyGateResult] = []
-        variants_by_id = {variant.variant_id: variant for variant in variants}
-        for variant in variants:
-            gate = self.safety_gate.evaluate_variant(variant)
-            gate.variant_id = variant.variant_id
-            gates.append(gate)
-        for record in raw_records:
-            if self.agent._is_error_record(record):
-                continue
-            raw_variant_id = str(record.raw_response.get("variant_id") or "")
-            variant = variants_by_id.get(raw_variant_id)
-            if variant is None:
-                variant = self._match_record_variant(record, variants)
-            if variant is None:
-                continue
-            card = self.builder.build(record, variant)
-            cards.append(card)
-            card_gate = self.safety_gate.evaluate_card(card)
-            card_gate.variant_id = card.variant_id
-            gates.append(card_gate)
-        cards = self._dedupe_evidence_cards(cards)
+        if not variants:
+            answer, doctor_summary = self.answer_composer.compose(
+                variants=[], cards=[], gates=[],
+                missing_information=["未识别到标准变异写法，请检查基因与 HGVS（如 MYD88 p.L265P）"],
+                global_warnings=self._base_global_warnings(),
+                question=question,
+            )
+            meta = {
+                "provider_mode": self.provider_mode,
+                "agent_mode": self.agent_mode_effective,
+                "agent_mode_requested": self.agent_mode_requested,
+                "retrieved_at": retrieved_at,
+                "cache_hit": False,
+                "cache_key": cache_key,
+                "cache_entry_id": None,
+                "query_log_id": None,
+                "required_providers": required_providers,
+                "extended_providers": extended_providers,
+            }
+            audit: dict[str, Any] = {"raw_records": [], "agent_trace": [{"step": "plan", "agent": self.agent_mode_effective, "variant_count": 0}], "provider_status": {}, "resolver_status": {"enabled": self.resolver is not None, "state": "no_variants"}}
+            result = MolecularEvidenceResult(
+                meta=meta, query=query, variants=[], raw_records=[], evidence_cards=[], safety_gate_results=[],
+                answer_markdown=answer, doctor_summary=doctor_summary,
+                missing={"blocking": ["未识别到标准变异写法"], "advisory": []},
+                missing_by_variant={}, global_warnings=self._base_global_warnings(), audit=audit,
+            )
+            cache_entry_id = self._store_cache(cache_key, result.to_dict())
+            result.meta["cache_entry_id"] = cache_entry_id
+            log_id = self._write_audit_log(cache_key=cache_key, provider_mode=query_payload["provider_mode"], query_payload=query_payload, result=result, cache_hit=False)
+            result.meta["query_log_id"] = log_id
+            return result
+
+        # LLM agent signature: run(variants, question=..., trace=...) — pass question when available
+        try:
+            import inspect as _inspect
+
+            _sig = _inspect.signature(self.agent.run)
+            if "question" in _sig.parameters:
+                raw_records, agent_trace, provider_status, resolver_status = self.agent.run(  # type: ignore[call-arg]
+                    variants, question=question, trace=[]
+                )
+            else:
+                raw_records, agent_trace, provider_status, resolver_status = self.agent.run(variants)
+        except TypeError:
+            raw_records, agent_trace, provider_status, resolver_status = self.agent.run(variants)
+
+        cards, gates = self._build_cards_and_gates(raw_records, variants)
+        # Extended annotation (UniProt + OncoKB, best-effort) then scoring,
+        # then score-gated literature lookup (PubMed, score >= 6 only).
+        for extra_batch in (
+            self._extended_enrichment_records(variants, agent_trace, provider_status),
+        ):
+            if extra_batch:
+                raw_records = list(raw_records) + list(extra_batch)
+                batch_cards, batch_gates = self._build_cards_and_gates(
+                    list(extra_batch), variants, include_variant_gates=False
+                )
+                cards = self._dedupe_evidence_cards(list(cards) + batch_cards)
+                gates = list(gates) + batch_gates
+        scores = self._score_variants(variants, cards, raw_records)
+        pubmed_batch = self._pubmed_gated_records(variants, scores, agent_trace, provider_status)
+        if pubmed_batch:
+            raw_records = list(raw_records) + list(pubmed_batch)
+            batch_cards, batch_gates = self._build_cards_and_gates(
+                list(pubmed_batch), variants, include_variant_gates=False
+            )
+            cards = self._dedupe_evidence_cards(list(cards) + batch_cards)
+            gates = list(gates) + batch_gates
         cards.sort(key=self.answer_composer._card_rank)
         missing_by_variant, missing = self._collect_missing_information(variants)
-        missing_flat = missing["blocking"] + missing["advisory"]
-        global_warnings = [
-            "本工具仅用于分子证据解释，不构成患者级诊断或治疗建议。",
-            "不得将体细胞致癌性自动等同于可靶向治疗。",
-            "不得将其他癌种证据直接外推到 DLBCL。",
-            "不得仅凭一个或若干突变预测患者个体预后。",
-        ]
-        degraded_providers = [
-            name for name, item in provider_status.items() if item.get("state") == "degraded"
-        ]
-        if degraded_providers:
-            global_warnings.append(
-                f"数据库查询结果受限：{', '.join(degraded_providers)}；相关数据库本次未形成完整证据集，不能将未命中解释为无证据。"
+        global_warnings = self._build_global_warnings(provider_status)
+        answer, doctor_summary = self.answer_composer.compose(
+            variants=variants, cards=cards, gates=gates,
+            missing_information=missing["blocking"] + missing["advisory"],
+            global_warnings=global_warnings, question=question,
+        )
+        meta = {
+            "provider_mode": self.provider_mode,
+            "agent_mode": self.agent_mode_effective,
+            "agent_mode_requested": self.agent_mode_requested,
+            "retrieved_at": retrieved_at,
+            "cache_hit": False,
+            "cache_key": cache_key,
+            "cache_entry_id": None,
+            "query_log_id": None,
+            "required_providers": required_providers,
+            "extended_providers": extended_providers,
+        }
+        audit = {"raw_records": raw_records, "agent_trace": agent_trace, "provider_status": provider_status, "resolver_status": resolver_status}
+        result = MolecularEvidenceResult(
+            meta=meta, query=query, variants=variants, raw_records=raw_records, evidence_cards=cards,
+            safety_gate_results=gates, answer_markdown=answer, doctor_summary=doctor_summary,
+            missing=missing, missing_by_variant=missing_by_variant, global_warnings=global_warnings, audit=audit,
+        )
+        cache_entry_id = self._store_cache(cache_key, result.to_dict())
+        result.meta["cache_entry_id"] = cache_entry_id
+        log_id = self._write_audit_log(cache_key=cache_key, provider_mode=query_payload["provider_mode"], query_payload=query_payload, result=result, cache_hit=False)
+        result.meta["query_log_id"] = log_id
+        return result
+
+    def analyze_stream(
+        self,
+        *,
+        text: str,
+        disease: str = "DLBCL",
+        sample_type: Optional[str] = None,
+        genome_build: Optional[str] = None,
+        transcript: Optional[str] = None,
+        variant_type: Optional[str] = None,
+        question: Optional[str] = None,
+    ):
+        """Streaming variant of analyze(): yields live agent events, returns final result.
+
+        Events: {"type": "status"|"tool_result", ...}; final return value is the
+        same MolecularEvidenceResult as analyze().
+        """
+        import inspect as _inspect
+
+        retrieved_at = utc_now_iso()
+        query_payload = {
+            "text": text,
+            "disease": disease,
+            "sample_type": sample_type,
+            "genome_build": genome_build,
+            "transcript": transcript,
+            "variant_type": variant_type,
+            "question": question,
+            "provider_mode": self.provider_mode,
+        }
+        required_providers = list(getattr(self.agent, "required_providers", MolecularEvidenceAgent.REQUIRED_PROVIDERS))
+        agent_providers = getattr(self.agent, "providers", self._providers_for_agent)
+        extended_providers = sorted(
+            {provider.provider_name for provider in agent_providers} - set(required_providers)
+        )
+        query = {
+            "question": question,
+            "disease": disease,
+            "sample_type": sample_type,
+            "genome_build": genome_build,
+            "transcript": transcript,
+            "variant_type": variant_type,
+            "provider_mode": self.provider_mode,
+            "agent_mode": self.agent_mode_effective,
+            "agent_mode_requested": self.agent_mode_requested,
+        }
+        cache_key = self._make_cache_key(
+            text=text, disease=disease, sample_type=sample_type, genome_build=genome_build,
+            transcript=transcript, variant_type=variant_type, provider_name=f"{self.provider_mode}:{self.agent_mode_effective}:providers-v12-oncoscore",
+        )
+        cached = self._load_cache(cache_key)
+        if cached is not None:
+            yield {"type": "status", "stage": "cache", "label": "命中缓存，直接返回上次结果", "detail": {"cache_key": cache_key[:16]}}
+            result = self._result_from_payload(cached, cache_hit=True, cache_key=cache_key)
+            log_id = self._write_audit_log(
+                cache_key=cache_key,
+                provider_mode=query_payload["provider_mode"],
+                query_payload=query_payload,
+                result=result,
+                cache_hit=True,
+                cache_source_log_id=(cached.get("meta") or {}).get("query_log_id"),
             )
+            result.meta["query_log_id"] = log_id
+            result.meta["cache_hit"] = True
+            result.meta["cache_key"] = cache_key
+            result.meta["cache_entry_id"] = cached.get("cache_entry_id") or cached.get("id")
+            yield {"type": "final", "payload": result.to_dict()}
+            return result
+
+        variants = self.parser.parse(
+            text,
+            disease=disease,
+            sample_type=sample_type,
+            genome_build=genome_build,
+            transcript=transcript,
+            variant_type=variant_type,
+        )
+        yield {
+            "type": "status", "stage": "parsed",
+            "label": f"识别到 {len(variants)} 个变异",
+            "detail": {"variants": [{"variant_id": v.variant_id, "gene": v.gene, "protein_hgvs": v.protein_hgvs, "cdna_hgvs": v.cdna_hgvs, "mapping_status": v.mapping_status} for v in variants]},
+        }
+
+        # Prefer streaming agent entry; fall back to blocking run() for agents without it.
+        raw_records: list[RawEvidenceRecord] = []
+        agent_trace: list[dict[str, Any]] = []
+        provider_status: dict[str, dict[str, Any]] = {}
+        resolver_status: dict[str, Any] = {}
+        stream_run = getattr(self.agent, "run_streaming", None)
+        if stream_run is not None and self.agent.__class__.__name__ in {"MolecularLLMAgent", "MolecularEvidenceAgent"}:
+            try:
+                _sig = _inspect.signature(stream_run)
+                if "question" in _sig.parameters:
+                    gen = stream_run(variants, question=question, trace=[])
+                else:
+                    gen = stream_run(variants, trace=[])
+                while True:
+                    try:
+                        event = next(gen)
+                    except StopIteration as stop:
+                        final = stop.value or ([], [], {}, {})
+                        raw_records, agent_trace, provider_status, resolver_status = final
+                        break
+                    if isinstance(event, dict) and event.get("type") in {"status", "tool_result"}:
+                        yield event
+            except TypeError:
+                raw_records, agent_trace, provider_status, resolver_status = self.agent.run(variants)
+        else:
+            try:
+                _sig2 = _inspect.signature(self.agent.run)
+                if "question" in _sig2.parameters:
+                    raw_records, agent_trace, provider_status, resolver_status = self.agent.run(variants, question=question, trace=[])  # type: ignore[call-arg]
+                else:
+                    raw_records, agent_trace, provider_status, resolver_status = self.agent.run(variants)
+            except TypeError:
+                raw_records, agent_trace, provider_status, resolver_status = self.agent.run(variants)
+
+        cards, gates = self._build_cards_and_gates(raw_records, variants)
+        for extra_batch in (
+            self._extended_enrichment_records(variants, agent_trace, provider_status),
+        ):
+            if extra_batch:
+                raw_records = list(raw_records) + list(extra_batch)
+                batch_cards, batch_gates = self._build_cards_and_gates(
+                    list(extra_batch), variants, include_variant_gates=False
+                )
+                cards = self._dedupe_evidence_cards(list(cards) + batch_cards)
+                gates = list(gates) + batch_gates
+        scores = self._score_variants(variants, cards, raw_records)
+        pubmed_batch = self._pubmed_gated_records(variants, scores, agent_trace, provider_status)
+        if pubmed_batch:
+            raw_records = list(raw_records) + list(pubmed_batch)
+            batch_cards, batch_gates = self._build_cards_and_gates(
+                list(pubmed_batch), variants, include_variant_gates=False
+            )
+            cards = self._dedupe_evidence_cards(list(cards) + batch_cards)
+            gates = list(gates) + batch_gates
+        cards.sort(key=self.answer_composer._card_rank)
+        missing_by_variant, missing = self._collect_missing_information(variants)
+        global_warnings = self._build_global_warnings(provider_status)
         answer, doctor_summary = self.answer_composer.compose(
             variants=variants,
             cards=cards,
             gates=gates,
-            missing_information=missing_flat,
+            missing_information=missing["blocking"] + missing["advisory"],
             global_warnings=global_warnings,
             question=question,
         )
         meta = {
             "provider_mode": self.provider_mode,
+            "agent_mode": self.agent_mode_effective,
+            "agent_mode_requested": self.agent_mode_requested,
             "retrieved_at": retrieved_at,
             "cache_hit": False,
             "cache_key": cache_key,
@@ -2939,7 +4245,236 @@ class MolecularEvidenceService:
         result.meta["query_log_id"] = log_id
         if cache_entry_id:
             self._store_cache(cache_key, result.to_dict())
+        yield {"type": "final", "payload": result.to_dict()}
         return result
+
+    @staticmethod
+    def _is_error_record(record: RawEvidenceRecord) -> bool:
+        return (
+            str(record.provider_record_id or "").endswith("_QUERY_ERROR")
+            or str(record.raw_response.get("record_status") or "").lower() == "error"
+            or str(record.raw_response.get("evidence_type") or "").lower() == "query_error"
+        )
+
+    def _extended_enrichment_records(
+        self,
+        variants: list[NormalizedVariant],
+        trace: list[dict[str, Any]],
+        provider_status: dict[str, dict[str, Any]],
+    ) -> list[RawEvidenceRecord]:
+        """Best-effort extended annotation (UniProt + OncoKB) after the main agent run.
+
+        These providers are *extended*, never required: failures degrade
+        gracefully and mock mode stays fully offline (returns no records).
+        """
+        if self.provider_mode == "mock":
+            return []
+        providers: list[EvidenceProvider] = [UniProtProvider(), OncoKBProvider()]
+        retrievable = [v for v in variants if v.mapping_status not in {"ambiguous", "insufficient", "conflicting"}]
+        records: list[RawEvidenceRecord] = []
+        for provider in providers:
+            st = provider_status.setdefault(provider.provider_name, {
+                "required": False, "queried": False, "query_count": 0,
+                "record_count": 0, "error_count": 0, "state": "pending",
+            })
+            for variant in retrievable:
+                st["queried"] = True
+                st["query_count"] += 1
+                try:
+                    found = provider.search(variant)
+                except Exception as exc:
+                    st["error_count"] += 1
+                    trace.append({
+                        "step": "query_provider", "provider": provider.provider_name,
+                        "variant_id": variant.variant_id, "variant": variant.gene,
+                        "queried": True, "record_count": 0, "error_count": 1,
+                        "error": f"{type(exc).__name__}: {exc}", "stage": "extended_enrichment",
+                    })
+                    continue
+                usable = [r for r in found if not self._is_error_record(r)]
+                st["error_count"] += len(found) - len(usable)
+                for r in usable:
+                    r.raw_response.setdefault("variant_id", variant.variant_id)
+                st["record_count"] += len(usable)
+                records.extend(usable)
+                trace.append({
+                    "step": "query_provider", "provider": provider.provider_name,
+                    "variant_id": variant.variant_id, "variant": variant.gene,
+                    "queried": True, "record_count": len(usable),
+                    "error_count": len(found) - len(usable), "error": None,
+                    "stage": "extended_enrichment",
+                })
+            st["state"] = (
+                "degraded" if st["error_count"]
+                else ("no_evidence" if st["record_count"] == 0 and st["queried"] else "success")
+            )
+        return records
+
+    def _score_variants(
+        self,
+        variants: list[NormalizedVariant],
+        cards: list[EvidenceCard],
+        raw_records: list[RawEvidenceRecord],
+    ) -> dict[str, dict[str, Any]]:
+        """Run the somatic oncogenicity scorer per variant and attach results."""
+        from backend.app.services.oncogenicity import SomaticOncogenicityScorer
+
+        scorer = SomaticOncogenicityScorer()
+        cards_by_variant: dict[str, list[dict[str, Any]]] = {}
+        for card in cards:
+            d = card.to_dict()
+            cards_by_variant.setdefault(card.variant_id, []).append(d)
+        af_by_variant: dict[str, float] = {}
+        hotspot_by_variant: dict[str, bool] = {}
+        onco_by_variant: dict[str, str] = {}
+        domain_by_variant: dict[str, bool] = {}
+        deleterious_by_variant: dict[str, list[bool]] = {}
+        for record in raw_records:
+            vid = str(record.raw_response.get("variant_id") or "")
+            raw = record.raw_response
+            for key in ("allele_freq", "gnomad_af"):
+                value = raw.get(key)
+                if isinstance(value, (int, float)) and value >= 0:
+                    prev = af_by_variant.get(vid)
+                    if prev is None or float(value) < prev:
+                        af_by_variant[vid] = float(value)
+            if raw.get("oncokb_hotspot") is True:
+                hotspot_by_variant[vid] = True
+            if raw.get("oncokb_oncogenicity"):
+                onco_by_variant[vid] = str(raw["oncokb_oncogenicity"])
+            if raw.get("in_functional_domain") is True:
+                domain_by_variant[vid] = True
+            votes = deleterious_by_variant.setdefault(vid, [])
+            sift = str(raw.get("sift_prediction") or "").lower()
+            polyphen = str(raw.get("polyphen_prediction") or "").lower()
+            if sift == "deleterious":
+                votes.append(True)
+            elif sift in {"tolerated"}:
+                votes.append(False)
+            if polyphen in {"probably_damaging", "possibly_damaging"}:
+                votes.append(True)
+            elif polyphen == "benign":
+                votes.append(False)
+            preds = str(raw.get("functional_predictions") or "")
+            if preds and ("可能致病" in preds or "高危害" in preds):
+                votes.append(True)
+        scores: dict[str, dict[str, Any]] = {}
+        for variant in variants:
+            votes = deleterious_by_variant.get(variant.variant_id, [])
+            ann = variant.molecular_annotation or {}
+            result = scorer.score(
+                variant_id=variant.variant_id,
+                gene=variant.gene,
+                variant_type=ann.get("variant_type") or variant.variant_type,
+                cards=cards_by_variant.get(variant.variant_id, []),
+                allele_freq=af_by_variant.get(variant.variant_id),
+                predictions_deleterious=sum(1 for v in votes if v),
+                predictions_total=len(votes),
+                hotspot=hotspot_by_variant.get(variant.variant_id),
+                in_functional_domain=domain_by_variant.get(variant.variant_id),
+                oncokb_oncogenicity=onco_by_variant.get(variant.variant_id),
+            )
+            payload = result.to_dict()
+            variant.oncogenicity = payload
+            scores[variant.variant_id] = payload
+        return scores
+
+    def _pubmed_gated_records(
+        self,
+        variants: list[NormalizedVariant],
+        scores: dict[str, dict[str, Any]],
+        trace: list[dict[str, Any]],
+        provider_status: dict[str, dict[str, Any]],
+    ) -> list[RawEvidenceRecord]:
+        """Query PubMed only for variants scoring >= 6 (live/hybrid only)."""
+        if self.provider_mode == "mock":
+            return []
+        provider = PubMedProvider()
+        st = provider_status.setdefault(provider.provider_name, {
+            "required": False, "queried": False, "query_count": 0,
+            "record_count": 0, "error_count": 0, "state": "pending",
+        })
+        triggered = [
+            v for v in variants
+            if (scores.get(v.variant_id) or {}).get("triggers_literature") is True
+            and v.mapping_status not in {"ambiguous", "insufficient", "conflicting"}
+        ]
+        trace.append({
+            "step": "literature_gate",
+            "trigger_score": 6,
+            "triggered_variant_ids": [v.variant_id for v in triggered],
+            "skipped_variant_ids": [
+                v.variant_id for v in variants if v.variant_id not in {t.variant_id for t in triggered}
+            ],
+        })
+        records: list[RawEvidenceRecord] = []
+        for variant in triggered:
+            st["queried"] = True
+            st["query_count"] += 1
+            try:
+                found = provider.search(variant)
+            except Exception as exc:
+                st["error_count"] += 1
+                trace.append({
+                    "step": "query_provider", "provider": provider.provider_name,
+                    "variant_id": variant.variant_id, "variant": variant.gene,
+                    "queried": True, "record_count": 0, "error_count": 1,
+                    "error": f"{type(exc).__name__}: {exc}", "stage": "literature_gate",
+                })
+                continue
+            usable = [r for r in found if not self._is_error_record(r)]
+            st["error_count"] += len(found) - len(usable)
+            for r in usable:
+                r.raw_response.setdefault("variant_id", variant.variant_id)
+            st["record_count"] += len(usable)
+            records.extend(usable)
+            trace.append({
+                "step": "query_provider", "provider": provider.provider_name,
+                "variant_id": variant.variant_id, "variant": variant.gene,
+                "queried": True, "record_count": len(usable),
+                "error_count": len(found) - len(usable), "error": None,
+                "stage": "literature_gate",
+            })
+        if st["queried"]:
+            st["state"] = (
+                "degraded" if st["error_count"]
+                else ("no_evidence" if st["record_count"] == 0 else "success")
+            )
+        return records
+
+    def _build_cards_and_gates(
+        self,
+        raw_records: list[RawEvidenceRecord],
+        variants: list[NormalizedVariant],
+        *,
+        include_variant_gates: bool = True,
+    ) -> tuple[list[EvidenceCard], list[SafetyGateResult]]:
+        cards: list[EvidenceCard] = []
+        gates: list[SafetyGateResult] = []
+        variants_by_id = {variant.variant_id: variant for variant in variants}
+        if include_variant_gates:
+            for variant in variants:
+                gate = self.safety_gate.evaluate_variant(variant)
+                gate.variant_id = variant.variant_id
+                gates.append(gate)
+        for record in raw_records:
+            is_error = self._is_error_record(record)
+            if is_error:
+                continue
+            raw_variant_id = str(record.raw_response.get("variant_id") or "")
+            variant = variants_by_id.get(raw_variant_id)
+            if variant is None:
+                variant = self._match_record_variant(record, variants)
+            if variant is None:
+                continue
+            card = self.builder.build(record, variant)
+            cards.append(card)
+            card_gate = self.safety_gate.evaluate_card(card)
+            card_gate.variant_id = card.variant_id
+            gates.append(card_gate)
+        cards = self._dedupe_evidence_cards(cards)
+        cards.sort(key=self.answer_composer._card_rank)
+        return cards, gates
 
     def _dedupe_evidence_cards(
         self, cards: list[EvidenceCard]
@@ -3192,8 +4727,25 @@ class MolecularEvidenceService:
                     global_advisory.append(item)
         return missing_by_variant, {"blocking": global_blocking, "advisory": global_advisory}
 
+    def _base_global_warnings(self) -> list[str]:
+        return [
+            "本工具仅用于分子证据解释，不构成患者级诊断或治疗建议。",
+            "不得将体细胞致癌性自动等同于可靶向治疗。",
+            "不得将其他癌种证据直接外推到 DLBCL。",
+            "不得仅凭一个或若干突变预测患者个体预后。",
+        ]
+
+    def _build_global_warnings(self, provider_status: dict[str, dict[str, Any]]) -> list[str]:
+        warnings = list(self._base_global_warnings())
+        degraded = [name for name, st in provider_status.items() if st.get("state") == "degraded"]
+        if degraded:
+            warnings.append(f"数据库查询结果受限：{', '.join(degraded)}；相关数据库本次未形成完整证据集，不能将未命中解释为无证据。")
+        empty = [name for name, st in provider_status.items() if st.get("state") == "no_evidence" and st.get("required")]
+        if empty and not degraded:
+            warnings.append(f"必查库未检索到直接证据：{', '.join(empty)}；请结合缺失信息补充转录本/坐标后复查。")
+        return warnings
+
     def _has_blocking_missing(self, variants: list[NormalizedVariant]) -> bool:
-        """判断是否存在阻断性缺失（只有这类缺失才应该触发"先补齐"提示）。"""
         for variant in variants:
             if variant.missing_fields:
                 return True

@@ -14,6 +14,7 @@ from backend.app.models_db import MolecularEvidenceCacheEntry, MolecularEvidence
 from backend.app.services.molecular_evidence import MolecularEvidenceService
 
 ProviderMode = Literal["mock", "live", "hybrid"]
+AgentMode = Literal["deterministic", "llm", "auto"]
 
 router = APIRouter(prefix="/api/molecular-evidence", tags=["molecular-evidence"])
 
@@ -27,6 +28,15 @@ class MolecularEvidenceQueryIn(BaseModel):
     variant_type: Optional[str] = Field(default=None, max_length=80)
     question: Optional[str] = Field(default=None, max_length=50000)
     provider_mode: ProviderMode = Field(default="live")
+    agent_mode: Optional[AgentMode] = Field(default=None, description="deterministic | llm | auto; 默认 auto")
+
+    @field_validator("agent_mode", mode="before")
+    @classmethod
+    def _normalize_agent_mode(cls, value):
+        if value is None:
+            return None
+        cleaned = str(value).strip().lower()
+        return cleaned if cleaned in {"deterministic", "llm", "auto"} else None
 
     @field_validator("variants_text", "disease", "sample_type", "genome_build", "transcript", "variant_type", "question", mode="before")
     @classmethod
@@ -305,17 +315,96 @@ def ocr_molecular_report(file: UploadFile = File(...)) -> dict[str, Any]:
 
 @router.post("/query")
 def query_molecular_evidence(body: MolecularEvidenceQueryIn) -> dict:
-    service = MolecularEvidenceService(provider_mode=body.provider_mode)
-    result = service.query(
-        text=body.variants_text,
-        disease=body.disease,
-        sample_type=body.sample_type,
-        genome_build=body.genome_build,
-        transcript=body.transcript,
-        variant_type=body.variant_type,
-        question=body.question,
+    import logging
+
+    logger = logging.getLogger("guideflow.molecular_evidence")
+    try:
+        service = MolecularEvidenceService(provider_mode=body.provider_mode, agent_mode=body.agent_mode)
+        result = service.query(
+            text=body.variants_text,
+            disease=body.disease,
+            sample_type=body.sample_type,
+            genome_build=body.genome_build,
+            transcript=body.transcript,
+            variant_type=body.variant_type,
+            question=body.question,
+        )
+        return result.to_dict()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("molecular-evidence query failed: provider_mode=%s agent_mode=%s", body.provider_mode, body.agent_mode)
+        raise HTTPException(
+            status_code=500,
+            detail=f"分子证据查询失败（{type(exc).__name__}）：{exc}。可先切 mock 模式验证链路，再切 live 复查外网数据库。",
+        ) from exc
+
+
+@router.post("/query/stream")
+def query_molecular_evidence_stream(body: MolecularEvidenceQueryIn):
+    import json as _json
+    import queue
+    import threading
+
+    from fastapi.responses import StreamingResponse
+
+    service = MolecularEvidenceService(provider_mode=body.provider_mode, agent_mode=body.agent_mode)
+
+    def event_gen():
+        try:
+            gen = service.analyze_stream(
+                text=body.variants_text,
+                disease=body.disease,
+                sample_type=body.sample_type,
+                genome_build=body.genome_build,
+                transcript=body.transcript,
+                variant_type=body.variant_type,
+                question=body.question,
+            )
+            while True:
+                try:
+                    event = next(gen)
+                except StopIteration as stop:
+                    # generator return (the MolecularEvidenceResult) — also emitted as final already
+                    final_payload = getattr(stop, "value", None)
+                    if final_payload is not None and hasattr(final_payload, "to_dict"):
+                        yield {"type": "final", "payload": final_payload.to_dict()}
+                    break
+                yield event
+        except Exception as exc:  # pragma: no cover - surface as error event
+            yield {"type": "error", "detail": f"{type(exc).__name__}: {exc}"}
+
+    def sse_bytes():
+        for event in event_gen():
+            yield f"data: {_json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
+
+    # Reuse the same queue-bridged async adapter pattern as /api/ask stream if needed,
+    # but synchronous StreamingResponse is sufficient for SSE consumers.
+    q: queue.Queue = queue.Queue(maxsize=64)
+
+    def worker():
+        try:
+            for chunk in sse_bytes():
+                q.put(chunk)
+        finally:
+            q.put(None)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    async def agen():
+        import asyncio
+
+        while True:
+            item = await asyncio.to_thread(q.get)
+            if item is None:
+                break
+            yield item
+
+    return StreamingResponse(
+        agen(),
+        media_type="text/event-stream; charset=utf-8",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
-    return result.to_dict()
 
 
 @router.get("/logs")

@@ -84,6 +84,14 @@ routing_mode: agentic
 # 智能体工具循环最大步数
 agent_max_steps: 4
 
+# ── 分子证据子智能体（与主问答联动） ─────────────────────────────
+# 主问答是否启用分子证据检索（识别到基因+HGVS 时并发启动子智能体）
+enable_molecular_evidence: true
+# 主问答中分子证据的数据源模式：mock=本地示例（不走外网）| live=真实 ClinVar/CIViC 等 | hybrid
+molecular_provider_mode_default: live
+# 主答案等待并发分子检索的最长时间（秒），超时则降级为不含分子证据的回答
+molecular_wait_timeout_s: 25
+
 # 送入 VLM 的图片安全上限（按需点名，不再写死“必须送几张”）
 figure_ceiling: 4
 max_images: 4

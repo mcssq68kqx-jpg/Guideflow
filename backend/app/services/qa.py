@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
@@ -48,6 +48,7 @@ from backend.app.services.literature_service import (
     build_literature_service,
     submit_literature_search,
 )
+from backend.app.services.molecular_intent import MolecularIntent, detect_molecular_intent
 from backend.app.services.multimodal_client import _split_answer_and_summary, load_multimodal_client
 from backend.app.services.page_image import PageImageRenderer
 from backend.app.services.page_summary_cache import PageSummaryCache
@@ -58,6 +59,11 @@ from backend.app.services.retrieval import HybridRetriever
 from backend.app.services.source_display import build_cite_context_payload
 from backend.app.services.tracing import TraceLogger
 from backend.app.services.verifier import verify_answer
+
+# Molecular sub-agent runs off the hot path: the main agent loop and the variant
+# retrieval proceed in parallel instead of serialising (variant retrieval can be
+# slow when live providers are enabled).
+_MOLECULAR_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="molecular")
 
 
 @dataclass
@@ -93,6 +99,9 @@ class _AskContext:
     literature_future: Any = None
     literature: List[LiteratureHit] = field(default_factory=list)
     enable_literature: bool = False
+    molecular_evidence: Optional[Dict[str, Any]] = None
+    molecular_future: Any = None
+    molecular_intent: Any = None
 
 
 class QAService:
@@ -229,6 +238,22 @@ class QAService:
         )
         routing_mode = str(getattr(self.settings, "routing_mode", "agentic") or "agentic").lower()
         literature_future = self._start_literature_future(standalone, lit_enabled)
+        molecular_intent = (
+            detect_molecular_intent(standalone, history)
+            if bool(getattr(self.settings, "enable_molecular_evidence", True))
+            else MolecularIntent()
+        )
+        molecular_future = self._start_molecular_future(molecular_intent, standalone)
+        trace.log(
+            "molecular_intent",
+            {
+                "level": molecular_intent.level,
+                "reason": molecular_intent.reason,
+                "genes": molecular_intent.genes,
+                "variants_text": molecular_intent.variants_text,
+                "concurrent": molecular_future is not None,
+            },
+        )
 
         yield {
             "type": "meta",
@@ -240,10 +265,18 @@ class QAService:
             "run_id": trace.run_id,
             "routing_mode": routing_mode,
             "enable_literature": lit_enabled,
+            "molecular_intent": molecular_intent.to_dict(),
         }
 
         if lit_enabled:
             yield status_event("literature", "正在检索 PubMed 相关文献…")
+
+        if molecular_future is not None:
+            yield status_event(
+                "molecular",
+                f"检索分子证据：{molecular_intent.variants_text[:40] or '变异'}",
+                {"variants_text": molecular_intent.variants_text, "level": molecular_intent.level},
+            )
 
         status_events: List[dict] = []
         if routing_mode == "agentic":
@@ -254,6 +287,7 @@ class QAService:
                 history=history,
                 disease_scope=disease_scope,
                 trace=trace,
+                molecular_intent=molecular_intent,
             )
             agent_state = None
             while True:
@@ -292,6 +326,14 @@ class QAService:
 
         ctx.enable_literature = lit_enabled
         ctx.literature_future = literature_future
+        ctx.molecular_intent = molecular_intent
+        ctx.molecular_future = molecular_future
+        if ctx.molecular_evidence is None:
+            ctx.molecular_evidence = self._collect_molecular(ctx)
+        if ctx.molecular_evidence is not None and ctx.bundle is not None:
+            # The prompt is assembled from the bundle; refresh it so the final
+            # generation can cite [Mn] even when the result arrived late.
+            ctx.bundle.molecular_evidence = ctx.molecular_evidence
 
         yield status_event("generate", "生成回答中…")
 
@@ -440,6 +482,93 @@ class QAService:
             }
         return list(result.hits or []), result.degraded, dict(result.diagnostics or {})
 
+    def _resolve_molecular_provider_mode(self) -> str:
+        """Default provider mode for the main QA pipeline.
+
+        Previously hardcoded to "mock" so variant questions never hit the
+        network during the main loop. Now configurable: with the concurrent
+        Future the latency concern that motivated "mock" no longer applies.
+        """
+        raw = str(
+            getattr(self.settings, "molecular_provider_mode_default", "mock") or "mock"
+        ).strip().lower()
+        return raw if raw in ("mock", "live", "hybrid") else "mock"
+
+    def _start_molecular_future(
+        self, intent: MolecularIntent, question: str, disease: str = "DLBCL"
+    ) -> Optional[Future]:
+        """Run the molecular sub-agent on a background thread when intent is strong."""
+        if intent is None or not intent.should_run:
+            return None
+        if not bool(getattr(self.settings, "enable_molecular_evidence", True)):
+            return None
+        variants_text = (intent.variants_text or "").strip()
+        if not variants_text:
+            return None
+        provider_mode = self._resolve_molecular_provider_mode()
+
+        def _run() -> Dict[str, Any]:
+            from backend.app.services.molecular_evidence import MolecularEvidenceService
+
+            service = MolecularEvidenceService(provider_mode=provider_mode)
+            result = service.analyze(
+                text=variants_text,
+                disease=disease,
+                sample_type="tumor tissue",
+                question=question,
+            )
+            return result.to_dict()
+
+        try:
+            return _MOLECULAR_EXECUTOR.submit(_run)
+        except Exception:
+            return None
+
+    def _collect_molecular(self, ctx: _AskContext) -> Optional[Dict[str, Any]]:
+        """Await the concurrent molecular run (or reuse the agent's inline result)."""
+        future = ctx.molecular_future
+        if future is None:
+            return ctx.molecular_evidence
+        timeout_s = float(getattr(self.settings, "molecular_wait_timeout_s", 25) or 25)
+        try:
+            payload = future.result(timeout=timeout_s)
+        except Exception as exc:
+            ctx.trace.log(
+                "molecular_evidence_error",
+                {"error": f"{type(exc).__name__}:{exc}", "stage": "collect"},
+            )
+            degraded = f"molecular_unavailable:{type(exc).__name__}"
+            diagnostics = dict(ctx.diagnostics or {})
+            degraded_list = list(diagnostics.get("degraded") or [])
+            degraded_list.append(degraded)
+            diagnostics["degraded"] = degraded_list
+            ctx.diagnostics = diagnostics
+            ctx.molecular_future = None
+            return ctx.molecular_evidence
+        compact = {
+            "provider_mode": payload.get("meta", {}).get("provider_mode"),
+            "agent_mode": payload.get("meta", {}).get("agent_mode"),
+            "variant_count": len(payload.get("variants", []) or []),
+            "evidence_count": len(payload.get("evidence", []) or []),
+            "summary": payload.get("summary"),
+            "variants": (payload.get("variants") or [])[:8],
+            "evidence": (payload.get("evidence") or [])[:12],
+            "missing": payload.get("missing"),
+            "global_warnings": (payload.get("global_warnings") or [])[:6],
+            "answer_markdown": payload.get("answer", {}).get("markdown")
+            if isinstance(payload.get("answer"), dict)
+            else None,
+            "query": {
+                "variants_text": (ctx.molecular_intent.variants_text if ctx.molecular_intent else ""),
+                "disease": "DLBCL",
+            },
+            "source": "qa_concurrent",
+        }
+        ctx.molecular_evidence = compact
+        ctx.molecular_future = None
+        ctx.trace.log("molecular_evidence", {k: v for k, v in compact.items() if k != "answer_markdown"})
+        return compact
+
     def _prepare_ask(
         self,
         question: str,
@@ -467,6 +596,22 @@ class QAService:
             source=getattr(self.settings, "source_key", "nccn") or "nccn",
         )
         literature_future = self._start_literature_future(standalone, lit_enabled)
+        molecular_intent = (
+            detect_molecular_intent(standalone, history)
+            if bool(getattr(self.settings, "enable_molecular_evidence", True))
+            else MolecularIntent()
+        )
+        molecular_future = self._start_molecular_future(molecular_intent, standalone)
+        trace.log(
+            "molecular_intent",
+            {
+                "level": molecular_intent.level,
+                "reason": molecular_intent.reason,
+                "genes": molecular_intent.genes,
+                "variants_text": molecular_intent.variants_text,
+                "concurrent": molecular_future is not None,
+            },
+        )
         routing_mode = str(getattr(self.settings, "routing_mode", "agentic") or "agentic").lower()
         if routing_mode == "agentic":
             orch = AgentOrchestrator(self)
@@ -478,6 +623,7 @@ class QAService:
                 disease_scope=disease_scope,
                 trace=trace,
                 on_status=lambda e: status_events.append(e),
+                molecular_intent=molecular_intent,
             )
             ctx = self._context_from_agent_state(
                 question=question,
@@ -502,6 +648,12 @@ class QAService:
             )
         ctx.enable_literature = lit_enabled
         ctx.literature_future = literature_future
+        ctx.molecular_intent = molecular_intent
+        ctx.molecular_future = molecular_future
+        if ctx.molecular_evidence is None:
+            ctx.molecular_evidence = self._collect_molecular(ctx)
+        if ctx.molecular_evidence is not None and ctx.bundle is not None:
+            ctx.bundle.molecular_evidence = ctx.molecular_evidence
         return ctx
 
     def _context_from_agent_state(
@@ -539,6 +691,7 @@ class QAService:
 
         if agent_state.early_answer is not None:
             empty_normalized = normalize_query(standalone)
+            molecular_evidence = getattr(agent_state, "molecular_evidence", None)
             structured_trace = {
                 "question": question,
                 "standalone_question": standalone,
@@ -642,6 +795,7 @@ class QAService:
             )
             seed_page_code = seed_meta.get("seed_page_code")
 
+        molecular_evidence = getattr(agent_state, "molecular_evidence", None)
         bundle = EvidenceBundle(
             primary_hits=hits,
             attached_references=attached_references,
@@ -649,6 +803,7 @@ class QAService:
             figures=figures,
             graph_triples=graph_triples_prompt,
             graph_context=graph_context_prompt,
+            molecular_evidence=molecular_evidence,
         )
         use_vlm = (
             bool(figures)
@@ -678,7 +833,12 @@ class QAService:
         structured_trace["answer_kind"] = "guideline"
         structured_trace["disease_scope"] = disease_scope.key
         structured_trace["agent_steps"] = list(agent_state.steps)
-        prompt_text = build_evidence_prompt(standalone, bundle, route=route)
+        prompt_text = build_evidence_prompt(
+            standalone,
+            bundle,
+            route=route,
+            molecular_evidence=molecular_evidence,
+        )
         trace.log(
             "prompt_built",
             {
@@ -719,6 +879,7 @@ class QAService:
             structured_trace=structured_trace,
             agent_steps=list(agent_state.steps),
             status_events=status_events,
+            molecular_evidence=molecular_evidence,
         )
 
     def _prepare_ask_linear(
@@ -1138,12 +1299,40 @@ class QAService:
             graph_triples=graph_triples,
             graph_seed_candidates=graph_seed_candidates,
             literature=literature_hits,
+            molecular_evidence=ctx.molecular_evidence,
+            molecular_hint=self._build_molecular_hint(ctx),
             generation_mode=generation_mode,
             answer_kind=ctx.answer_kind,
             standalone_question=ctx.standalone_question,
             disease_scope=ctx.disease_scope.key,
             trace=structured_trace,
         )
+
+    def _build_molecular_hint(self, ctx: _AskContext) -> Optional[Dict[str, Any]]:
+        """Nudge the user when molecular intent exists but no evidence was retrieved.
+
+        Only medium/strong intent qualifies: a plain guideline question must not
+        be polluted with molecular prompts.
+        """
+        intent = ctx.molecular_intent
+        if intent is None or ctx.molecular_evidence is not None:
+            return None
+        if intent.level == "medium":
+            return {
+                "level": "medium",
+                "genes": list(intent.genes or []),
+                "message": "问题可能涉及分子变异，但未识别到标准 HGVS 写法（如 MYD88 p.L265P）。"
+                "补充标准 HGVS 后可做变异级证据检索。",
+                "variants_text": intent.variants_text,
+            }
+        if intent.level == "strong":
+            return {
+                "level": "strong",
+                "genes": list(intent.genes or []),
+                "message": "已识别到变异写法，但本次分子证据检索未返回结果，可稍后重试。",
+                "variants_text": intent.variants_text,
+            }
+        return None
 
     def _build_structured_trace(
         self,

@@ -96,6 +96,40 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "molecular_evidence_lookup",
+            "description": (
+                "分子变异证据查询：当问题包含基因名+突变写法（如 MYD88 p.L265P、TP53 p.R248Q、CD79B c.582A>T）"
+                "或询问变异的致病性/致癌性/临床证据/ClinVar/CIViC 证据时调用。自动执行坐标补全与三库检索，"
+                "返回证据卡与安全门控提示。可与 search_guidelines 并行使用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "variants_text": {
+                        "type": "string",
+                        "description": "从用户问题中提取的变异文本，保留基因与 HGVS，多个用逗号分隔（如 MYD88 p.L265P, CD79B p.Y196H）",
+                    },
+                    "disease": {
+                        "type": "string",
+                        "description": "疾病语境，默认 DLBCL；CSCO/EHA 可传对应病种",
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": "用户完整原始问题，用于意图与证据分级",
+                    },
+                    "provider_mode": {
+                        "type": "string",
+                        "enum": ["mock", "live", "hybrid"],
+                        "description": "数据源模式，默认 mock（不走外网，适合主问答联动）；live 仅分子页使用",
+                    },
+                },
+                "required": ["variants_text"],
+            },
+        },
+    },
 ]
 
 
@@ -117,6 +151,7 @@ class AgentState:
     ready: bool = False
     diagnostics: Dict[str, Any] = field(default_factory=dict)
     gate_degraded: Optional[str] = None
+    molecular_evidence: Optional[Dict[str, Any]] = None
 
 
 def status_event(stage: str, label: str, detail: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -151,6 +186,10 @@ def status_for_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         kind = str(arguments.get("kind") or "chitchat")
         label = "准备直接回复…" if kind == "chitchat" else "准备通用医学说明…"
         return status_event("direct", label, {"tool": name, "kind": kind})
+    if name == "molecular_evidence_lookup":
+        variants_text = str(arguments.get("variants_text") or "")[:60]
+        label = f"查询分子证据：{variants_text}" if variants_text else "查询分子证据中…"
+        return status_event("molecular", label, {"tool": name, "variants_text": variants_text})
     return status_event("tool", f"执行工具：{name}", {"tool": name})
 
 
